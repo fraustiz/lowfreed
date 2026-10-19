@@ -3,6 +3,8 @@ name = "lowfreed"
 version = "0.1.0"
 edition = "2021"
 description = "Configurateur du clavier Lofree Flow 2 (protocole VIA)"
+license = "MIT"
+repository = "https://github.com/fraustiz/lowfreed"
 
 [dependencies]
 anyhow = "1"

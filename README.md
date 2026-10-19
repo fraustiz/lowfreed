@@ -63,3 +63,7 @@ Le logiciel officiel trouvé (« Lofree Flowlite Key Mapper » v1.1.1.3) a été
 sans être exécuté. C'est une application Qt 5 basée sur un pilote générique « Compx » : elle passe par des
 rapports HID *Feature* et ne cible que `388D:0008`/`0009` (et d'autres marques), avec des firmwares embarqués.
 Le Flow 2 (`0003`) n'y figure pas : **ne pas utiliser cet outil sur le Flow 2**, d'où le passage par VIA.
+
+## Licence
+
+[MIT](LICENSE). Le fichier `assets/flow2_100_ansi.json` est la définition VIA publiée par Lofree.
