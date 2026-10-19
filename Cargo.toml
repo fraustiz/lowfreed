@@ -1,6 +1,6 @@
 [package]
 name = "lowfreed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Configurateur du clavier Lofree Flow 2 (protocole VIA)"
 license = "MIT"
@@ -13,6 +13,8 @@ hidapi = { version = "2.6", default-features = false, features = ["windows-nativ
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tray-icon = "0.26"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3

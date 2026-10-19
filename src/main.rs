@@ -1,30 +1,53 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod tray;
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use eframe::egui;
-use lowfreed::layout::Definition;
+use lowfreed::{
+    layout::Definition,
+    slider::Engine,
+    system::{self, Settings},
+};
 
 fn main() -> eframe::Result {
-    // `lowfreed <définition.json>` charge une autre définition VIA que celle du Flow 2.
-    let def = match std::env::args().nth(1) {
+    // `lowfreed [--tray] [définition.json]` : `--tray` démarre fenêtre masquée (lancement
+    // au démarrage de Windows) ; un JSON charge une autre définition VIA que celle du Flow 2.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let start_hidden = args.iter().any(|a| a == "--tray");
+    args.retain(|a| a != "--tray");
+    let def = match args.first() {
         Some(path) => {
-            let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path} : {e}"));
+            let json = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path} : {e}"));
             Definition::parse(&json).unwrap_or_else(|e| panic!("{path} : {e:#}"))
         }
         None => Definition::flow2(),
     };
+    // Lowfreed tourne déjà (zone de notification) : il vient d'afficher sa fenêtre.
+    let Some(show_signal) = system::single_instance() else { return Ok(()) };
+
+    let settings = Settings::load();
+    let engine = Engine::start(def.vendor_id, def.product_id, def.matrix.rows, def.matrix.cols, settings.slider);
+    let icon = icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("Lowfreed — {}", def.name))
             .with_inner_size([1240.0, 860.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_icon(Arc::new(icon())),
+            .with_icon(Arc::new(icon.clone())),
         ..Default::default()
     };
-    eframe::run_native("Lowfreed", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, def)))))
+    eframe::run_native(
+        "Lowfreed",
+        options,
+        Box::new(move |cc| {
+            let (tx, rx) = mpsc::channel();
+            tray::spawn(show_signal, icon, tx, cc.egui_ctx.clone());
+            Ok(Box::new(app::App::new(cc, def, engine, settings, rx, start_hidden)))
+        }),
+    )
 }
 
 /// Icône générée : touche orange arrondie.

@@ -8,9 +8,16 @@ Il parle directement au clavier par le protocole **VIA** (raw HID), sans navigat
   keycode libre). Chaque modification est écrite tout de suite dans le clavier.
 - **Macros** : les 16 macros du firmware, avec la syntaxe de VIA (`{KC_LCTL,KC_C}`, `{250}`…).
 - **Rétroéclairage** : luminosité, respiration, enregistrement permanent.
+- **Slider** : remplace le volume du slider latéral par une autre action (défilement vertical ou
+  horizontal, zoom, onglet suivant/précédent, piste suivante/précédente, flèches), avec inversion du sens
+  et sensibilité. F11/F12 et les autres touches volume gardent le volume.
+- **Couche en service** : détectée en tapant (Alt, Win, F11…), présélectionnée et marquée d'un ●.
 - **Testeur de touches** : affiche en direct les touches enfoncées (matrice du clavier).
 - **Exporter / Importer** : sauvegarde keymap + macros au format `.layout.json` de VIA.
 - **Réinitialiser** : keymap d'usine du firmware (avec confirmation).
+- **Arrière-plan** : fermer la fenêtre la range dans la zone de notification (clic gauche sur l'icône pour
+  rouvrir, clic droit → Quitter) ; option de lancement au démarrage de Windows (`lowfreed.exe --tray`).
+  Une seule instance tourne à la fois : relancer l'appli réaffiche la fenêtre.
 
 ## Compiler
 
@@ -30,6 +37,7 @@ lowfreed-cli info                  identité, protocole, couches, macros, rétro
 lowfreed-cli dump [couche]         keymap lisible
 lowfreed-cli macros                contenu des macros
 lowfreed-cli set 1 0 1 KC_F1       assigne un keycode (couche, ligne, colonne)
+lowfreed-cli slider scroll 60      remplace le slider pendant 60 s et affiche chaque cran (diagnostic)
 lowfreed-cli backup sauvegarde.layout.json
 lowfreed-cli restore sauvegarde.layout.json
 ```
@@ -55,6 +63,25 @@ Relevé sur le clavier branché (firmware révision `0x0016`) :
 - Windows transmet les réponses HID à tous les programmes ouverts sur l'interface : si VIA (usevia.app) tourne
   en même temps, ses réponses sont filtrées (chaque réponse doit reprendre l'en-tête de la requête).
 - Les macros tapent comme un clavier US : avec Windows en AZERTY, préférez des `{KC_…}`.
+
+### Le slider latéral
+
+Le firmware envoie « Volume + / − » (page Consumer, usages `0xE9`/`0xEA`, rapport n°4 de l'interface 2),
+et « Luminosité écran ± » (`0x6F`/`0x70`) avec Fn. Ce comportement est figé : le slider n'est ni dans la
+matrice, ni un encodeur VIA, ni une valeur personnalisée. Lowfreed le remplace donc côté Windows :
+
+1. un fil lit les rapports Consumer du Flow 2 et, à chaque « Volume ± », interroge la matrice VIA : si
+   aucune touche de volume du keymap n'est enfoncée, l'appui vient du slider ;
+2. un hook clavier bas niveau reçoit la touche `VK_VOLUME_UP/DOWN` que Windows en tire (marquée
+   *injectée*, drapeaux `0x11`), la bloque si elle vient du slider et envoie l'action choisie.
+
+Le remplacement ne fonctionne que pendant que Lowfreed tourne (fenêtre ou zone de notification).
+
+### La couche en service
+
+VIA ne dit pas quelle couche est active. Lowfreed compare chaque touche reçue par Windows (code de scan,
+indépendant de la disposition AZERTY/QWERTY) avec la matrice du Flow 2 au même instant : une touche qui
+diffère entre les couches de base (Alt/Win en bas à gauche, F11/F12…) révèle la couche Mac ou Windows.
 
 ## Analyse REA
 

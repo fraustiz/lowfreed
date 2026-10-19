@@ -2,6 +2,9 @@
 
 pub mod backup;
 pub mod keycodes;
+mod layer_detect;
 pub mod layout;
 pub mod macros;
+pub mod slider;
+pub mod system;
 pub mod via;

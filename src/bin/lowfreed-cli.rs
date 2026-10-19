@@ -13,6 +13,8 @@ Commandes :
   dump [couche]        keymap (toutes les couches ou une seule)
   macros               contenu des macros
   set <c> <l> <col> <kc>  assigne un keycode (ex. set 1 0 1 KC_F1)
+  slider <action> [s]  remplace le slider pendant s secondes (volume, scroll, hscroll,
+                       zoom, tabs, tracks, arrows) et affiche chaque cran
   backup <fichier>     sauvegarde keymap + macros (format VIA .layout.json)
   restore <fichier>    réécrit keymap + macros depuis une sauvegarde";
 
@@ -60,6 +62,7 @@ fn run(mut args: Vec<String>) -> Result<()> {
             println!("couche {layer}, touche {row},{col} → {}", keycodes::name(code));
             Ok(())
         }
+        "slider" => slider_test(&def, args.get(1).map(String::as_str), args.get(2)),
         "backup" => {
             let path = args.get(1).context("backup attend un fichier")?;
             let backup = Backup::read(&via, &def)?;
@@ -76,6 +79,73 @@ fn run(mut args: Vec<String>) -> Result<()> {
         }
         other => bail!("commande inconnue « {other} »\n\n{USAGE}"),
     }
+}
+
+fn slider_test(def: &Definition, action: Option<&str>, secs: Option<&String>) -> Result<()> {
+    use lowfreed::slider::{Action, Dir, Engine, SliderConfig};
+    let action = match action.context("slider attend une action")? {
+        "volume" => Action::Volume,
+        "scroll" => Action::Scroll,
+        "hscroll" => Action::HScroll,
+        "zoom" => Action::Zoom,
+        "tabs" => Action::Tabs,
+        "tracks" => Action::Tracks,
+        "arrows" => Action::Arrows,
+        other => bail!("action inconnue « {other} »"),
+    };
+    let secs: u64 = secs.map(|s| s.parse()).transpose()?.unwrap_or(60);
+    if lowfreed::system::single_instance().is_none() {
+        bail!("Lowfreed est déjà lancé : quittez-le (icône → Quitter) avant ce test");
+    }
+    let engine = Engine::start(
+        def.vendor_id,
+        def.product_id,
+        def.matrix.rows,
+        def.matrix.cols,
+        SliderConfig { action, ..Default::default() },
+    );
+    println!("Slider → {} pendant {secs} s", action.title());
+    let start = std::time::Instant::now();
+    let mut seen = None;
+    let mut ready = false;
+    let mut layer = None;
+    let mut counters = (0, 0);
+    let mut last_report = std::time::Instant::now();
+    while start.elapsed().as_secs() < secs {
+        let st = engine.status();
+        if (st.hook_keys, st.hid_volume) != counters && last_report.elapsed().as_secs() >= 1 {
+            counters = (st.hook_keys, st.hid_volume);
+            last_report = std::time::Instant::now();
+            println!(
+                "{:6.2}s  diagnostic : {} appuis vus par le hook (dont {} volume, drapeaux 0x{:X}), {} « Volume ± » lus sur le Flow 2",
+                start.elapsed().as_secs_f32(),
+                counters.0, st.hook_volume, st.hook_volume_flags,
+                counters.1
+            );
+        }
+        if engine.active_layer() != layer {
+            layer = engine.active_layer();
+            println!("{:6.2}s  couche en service : {layer:?}", start.elapsed().as_secs_f32());
+        }
+        let s = engine.status();
+        if !ready && s.device && s.hook {
+            println!("prêt (Flow 2 détecté, hook clavier actif)");
+            ready = true;
+        }
+        if let Some(last) = s.last.filter(|l| Some(l.at) != seen) {
+            seen = Some(last.at);
+            println!(
+                "{:6.2}s  {} {}  → {}   (total remplacés : {})",
+                last.at.duration_since(start).as_secs_f32(),
+                if last.from_slider { "slider" } else { "touche volume" },
+                if last.dir == Dir::Up { "+" } else { "−" },
+                if last.replaced { "remplacé" } else { "laissé au volume" },
+                s.replaced
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn info(via: &Via) -> Result<()> {

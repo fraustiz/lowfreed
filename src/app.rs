@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::Arc,
+    sync::{mpsc::Receiver, Arc},
     time::{Duration, Instant},
 };
 
@@ -17,8 +17,12 @@ use lowfreed::{
     keycodes::{self, Category},
     layout::Definition,
     macros,
+    slider::{Action, Dir, Engine},
+    system::{autostart, Settings},
     via::{backlight, Via},
 };
+
+use crate::tray::TrayCommand;
 
 const ACCENT: Color32 = Color32::from_rgb(255, 106, 0);
 const KEY: Color32 = Color32::from_rgb(46, 46, 51);
@@ -38,6 +42,7 @@ enum Tab {
     Keymap,
     Macros,
     Lighting,
+    Slider,
     Tester,
 }
 
@@ -122,18 +127,42 @@ pub struct App {
     pressed: Vec<bool>,
     seen: BTreeSet<(u8, u8)>,
     pending: Option<Pending>,
+    engine: Engine,
+    settings: Settings,
+    tray_rx: Receiver<TrayCommand>,
+    quitting: bool,
+    /// Commande de lancement au démarrage enregistrée dans le registre, s'il y en a une.
+    autostart: Option<String>,
+    /// Démarrage `--tray` : eframe affiche la fenêtre après la première image, on la remasque.
+    hide_frames: u8,
+    /// Dernière couche active détectée et déjà présélectionnée.
+    detected_layer: Option<u8>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, def: Definition) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        def: Definition,
+        engine: Engine,
+        settings: Settings,
+        tray_rx: Receiver<TrayCommand>,
+        start_hidden: bool,
+    ) -> Self {
         setup_style(&cc.egui_ctx);
         Self {
+            layer: settings.last_layer.unwrap_or(0) as usize,
+            detected_layer: None,
+            hide_frames: if start_hidden { 3 } else { 0 },
+            engine,
+            settings,
+            tray_rx,
+            quitting: false,
+            autostart: autostart::registered(),
             def,
             dev: None,
             last_attempt: None,
             status: ("Recherche du clavier…".into(), DIM_TEXT),
             tab: Tab::Keymap,
-            layer: 0,
             selected: None,
             category: Category::Basic,
             advanced: Advanced::default(),
@@ -213,6 +242,7 @@ impl App {
             if let Some(dev) = &mut self.dev {
                 dev.keymap[idx] = code;
             }
+            self.engine.keymap_changed();
             self.info(format!(
                 "Couche {layer}, touche {row},{col} → {} (enregistré dans le clavier)",
                 keycodes::name(code)
@@ -228,6 +258,7 @@ impl App {
                 dev.keymap = km;
             }
         }
+        self.engine.keymap_changed();
     }
 
     fn export(&mut self) {
@@ -312,6 +343,7 @@ impl App {
                 (Tab::Keymap, "Keymap"),
                 (Tab::Macros, "Macros"),
                 (Tab::Lighting, "Rétroéclairage"),
+                (Tab::Slider, "Slider"),
                 (Tab::Tester, "Testeur de touches"),
             ] {
                 ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(15.0));
@@ -321,13 +353,23 @@ impl App {
     }
 
     fn layer_bar(&mut self, ui: &mut egui::Ui, layers: u8) {
+        let active = self.detected_layer.map(|l| l as usize);
         ui.horizontal(|ui| {
             ui.label("Couche :");
             for l in 0..layers as usize {
                 let name = LAYER_NAMES.get(l).copied().unwrap_or("");
-                let text = if name.is_empty() { format!("{l}") } else { format!("{l} · {name}") };
-                ui.selectable_value(&mut self.layer, l, text)
-                    .on_hover_text("Rôle d'après le keymap d'usine du Flow 2");
+                let mut text = if name.is_empty() { format!("{l}") } else { format!("{l} · {name}") };
+                let mut hover = "Rôle d'après le keymap d'usine du Flow 2".to_string();
+                if active == Some(l) {
+                    text = format!("● {text}");
+                    hover.push_str("\nCouche en service sur le clavier (détectée)");
+                }
+                ui.selectable_value(&mut self.layer, l, text).on_hover_text(hover);
+            }
+            if active.is_none() {
+                ui.label(
+                    RichText::new("couche en service inconnue : appuyez sur Alt ou Win du Flow 2").color(DIM_TEXT),
+                );
             }
         });
     }
@@ -649,6 +691,109 @@ impl App {
         );
     }
 
+    fn save_settings(&mut self) {
+        let r = self.settings.save();
+        self.check("Enregistrement des réglages", r);
+    }
+
+    fn slider_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new(
+                "Le slider latéral envoie « Volume + / − » (et « Luminosité écran ± » avec Fn). Ce comportement \
+                 est figé dans le firmware Lofree : VIA ne le voit pas. Lowfreed le remplace donc côté Windows, \
+                 tant qu'il tourne (fenêtre ouverte ou icône dans la zone de notification). \
+                 F11/F12 et les autres touches volume du keymap gardent le volume.",
+            )
+            .color(DIM_TEXT),
+        );
+        ui.add_space(8.0);
+
+        let status = self.engine.status();
+        ui.horizontal(|ui| {
+            let (txt, color) = match (status.device, status.hook) {
+                (true, true) => ("● Slider surveillé", OK),
+                (false, _) => ("● Flow 2 non détecté (USB)", DIM_TEXT),
+                (true, false) => ("● Hook clavier indisponible", ERROR),
+            };
+            ui.label(RichText::new(txt).color(color));
+            if let Some(last) = status.last {
+                let ago = last.at.elapsed().as_secs_f32();
+                let dir = if last.dir == Dir::Up { "+" } else { "−" };
+                let what = if last.from_slider { "slider" } else { "touche volume" };
+                let done = if last.replaced { "remplacé" } else { "laissé au volume" };
+                ui.label(RichText::new(format!("dernier : {what} {dir}, {done}, il y a {ago:.0} s")).color(DIM_TEXT));
+            }
+            ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(300));
+        ui.add_space(10.0);
+
+        let mut cfg = self.settings.slider;
+        ui.label(RichText::new("Action du slider").strong().size(16.0));
+        ui.add_space(4.0);
+        egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+            for action in Action::ALL {
+                ui.radio_value(&mut cfg.action, action, action.title());
+                ui.label(RichText::new(action.detail()).color(DIM_TEXT));
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+        ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
+            ui.checkbox(&mut cfg.invert, "Inverser le sens");
+            ui.horizontal(|ui| {
+                ui.label("Sensibilité : une action tous les");
+                ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
+            });
+        });
+        if cfg != self.settings.slider {
+            self.settings.slider = cfg;
+            self.engine.set_config(cfg);
+            self.save_settings();
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(RichText::new("Arrière-plan").strong().size(16.0));
+        ui.add_space(4.0);
+        if ui
+            .checkbox(
+                &mut self.settings.close_to_tray,
+                "Fermer la fenêtre la réduit dans la zone de notification (sinon Lowfreed s'arrête)",
+            )
+            .changed()
+        {
+            self.save_settings();
+        }
+        let current = autostart::command().ok();
+        let mut enabled = self.autostart.is_some();
+        if ui
+            .checkbox(&mut enabled, "Lancer Lowfreed au démarrage de Windows, dans la zone de notification")
+            .changed()
+        {
+            let r = autostart::set(enabled);
+            self.check("Démarrage automatique", r);
+            self.autostart = autostart::registered();
+        }
+        if let (Some(registered), Some(current)) = (self.autostart.clone(), current) {
+            if registered != current {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Le démarrage lance un autre exécutable : {registered}")).color(ERROR),
+                    );
+                    if ui.button("Utiliser celui-ci").clicked() {
+                        let r = autostart::set(true);
+                        self.check("Démarrage automatique", r);
+                        self.autostart = autostart::registered();
+                    }
+                });
+            }
+        }
+        ui.label(
+            RichText::new("Icône près de l'horloge : clic gauche pour ouvrir, clic droit → Quitter.").color(DIM_TEXT),
+        );
+    }
+
     fn tester_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dev) = &self.dev else {
             not_connected(ui);
@@ -750,6 +895,7 @@ impl App {
             Pending::Import(path, backup) => {
                 let r = backup.write(&dev.via, &self.def);
                 if self.check("Import", r).is_some() {
+                    self.engine.keymap_changed();
                     self.connect();
                     self.info(format!("Sauvegarde importée : {}", path.display()));
                 }
@@ -759,6 +905,44 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Appelée aussi quand la fenêtre est masquée : commandes de la zone de notification
+    /// et fermeture → réduction.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.hide_frames > 0 {
+            self.hide_frames -= 1;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.request_repaint();
+        }
+        // Couche active détectée sur le clavier : on la présélectionne une fois par changement.
+        if let Some(layer) = self.engine.active_layer() {
+            if self.detected_layer != Some(layer) {
+                self.detected_layer = Some(layer);
+                self.layer = layer as usize;
+                if self.settings.last_layer != Some(layer) {
+                    self.settings.last_layer = Some(layer);
+                    self.save_settings();
+                }
+            }
+        }
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                TrayCommand::Open => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayCommand::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.settings.close_to_tray && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.dev.is_none() && self.last_attempt.is_none_or(|t| t.elapsed() >= RECONNECT_EVERY) {
             self.connect();
@@ -777,6 +961,7 @@ impl eframe::App for App {
             Tab::Keymap => self.keymap_tab(ui),
             Tab::Macros => self.macros_tab(ui),
             Tab::Lighting => self.lighting_tab(ui),
+            Tab::Slider => self.slider_tab(ui),
             Tab::Tester => self.tester_tab(ui),
         });
         let ctx = ui.ctx().clone();
