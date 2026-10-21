@@ -1,6 +1,7 @@
 //! Client du protocole VIA (raw HID, rapports de 32 octets, page d'usage 0xFF60).
 //!
-//! Le Flow 2 expose ce protocole sur son interface USB n°1. Les commandes et leurs
+//! Le Flow 2 expose ce protocole sur son interface USB n°1 en mode filaire,
+//! et sur son interface n°2 via le dongle 2.4G. Les commandes et leurs
 //! réponses ont été vérifiées sur le clavier (protocole v12, 6 couches, 16 macros).
 
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ pub const REPORT_LEN: usize = 32;
 const CHUNK: usize = 28;
 const USAGE_PAGE: u16 = 0xFF60;
 const USAGE: u16 = 0x61;
-const TIMEOUT: Duration = Duration::from_millis(600);
+const TIMEOUT: Duration = Duration::from_millis(1000);
 
 mod cmd {
     pub const GET_PROTOCOL_VERSION: u8 = 0x01;
@@ -51,6 +52,21 @@ pub struct DeviceInfo {
     pub product_id: u16,
     pub product: String,
     pub release: u16,
+}
+
+impl DeviceInfo {
+    /// `true` si connecté via le dongle sans fil 2.4 GHz (révision >= 0x2000, e.g. 0x2004).
+    pub fn is_wireless(&self) -> bool {
+        self.release >= 0x2000
+    }
+
+    pub fn transport_label(&self) -> &'static str {
+        if self.is_wireless() {
+            "2.4G"
+        } else {
+            "USB"
+        }
+    }
 }
 
 pub struct Via {
@@ -95,15 +111,23 @@ impl Via {
         self.dev.write(&out).context("écriture HID échouée")?;
 
         let deadline = Instant::now() + TIMEOUT;
+        let mut last_write = Instant::now();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 bail!("pas de réponse du clavier (commande 0x{:02X})", req[0]);
             }
+            // En 2.4G, si le clavier était en veille radio, le premier paquet peut
+            // être manqué lors du réveil : si aucune réponse après 200 ms, on réémet.
+            if last_write.elapsed() >= Duration::from_millis(200) {
+                let _ = self.dev.write(&out);
+                last_write = Instant::now();
+            }
+            let poll = left.min(Duration::from_millis(100));
             let mut resp = [0u8; REPORT_LEN];
             let n = self
                 .dev
-                .read_timeout(&mut resp, left.as_millis().max(1) as i32)
+                .read_timeout(&mut resp, poll.as_millis().max(1) as i32)
                 .context("lecture HID échouée")?;
             if n == 0 {
                 continue;

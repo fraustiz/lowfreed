@@ -15,6 +15,7 @@ Commandes :
   set <c> <l> <col> <kc>  assigne un keycode (ex. set 1 0 1 KC_F1)
   slider <action> [s]  remplace le slider pendant s secondes (volume, scroll, hscroll,
                        zoom, tabs, tracks, arrows) et affiche chaque cran
+  light <0-255> [0|1]  règle la luminosité et le mode (0=fixe, 1=respiration)
   backup <fichier>     sauvegarde keymap + macros (format VIA .layout.json)
   restore <fichier>    réécrit keymap + macros depuis une sauvegarde";
 
@@ -63,6 +64,28 @@ fn run(mut args: Vec<String>) -> Result<()> {
             Ok(())
         }
         "slider" => slider_test(&def, args.get(1).map(String::as_str), args.get(2)),
+        "light" => {
+            use lowfreed::via::backlight;
+            let b: u8 = args.get(1).context("light attend une luminosité (0-255)")?.parse()?;
+            via.custom_set(backlight::CHANNEL, backlight::BRIGHTNESS, b)?;
+            if let Some(mode_str) = args.get(2) {
+                let effect = match mode_str.to_lowercase().as_str() {
+                    "0" | "fixe" | "static" => 0u8,
+                    "1" | "respiration" | "breathing" => 1u8,
+                    other => bail!("mode inconnu « {other} » (attendu: 0/fixe ou 1/respiration)"),
+                };
+                via.custom_set(backlight::CHANNEL, backlight::EFFECT, effect)?;
+            }
+            let _ = via.custom_save(backlight::CHANNEL);
+            let cur_b = via.custom_get(backlight::CHANNEL, backlight::BRIGHTNESS)?;
+            let cur_e = via.custom_get(backlight::CHANNEL, backlight::EFFECT)?;
+            println!(
+                "Rétroéclairage : luminosité {cur_b}/255 ({:.0} %), mode {}",
+                cur_b as f32 / 255.0 * 100.0,
+                if cur_e == 0 { "fixe" } else { "respiration" }
+            );
+            Ok(())
+        }
         "backup" => {
             let path = args.get(1).context("backup attend un fichier")?;
             let backup = Backup::read(&via, &def)?;
@@ -150,7 +173,13 @@ fn slider_test(def: &Definition, action: Option<&str>, secs: Option<&String>) ->
 
 fn info(via: &Via) -> Result<()> {
     let i = &via.info;
+    let transport = if i.is_wireless() {
+        "2.4 GHz (dongle sans fil)"
+    } else {
+        "USB (câble filaire)"
+    };
     println!("Clavier      : {} ({:04X}:{:04X}, révision {:04X})", i.product, i.vendor_id, i.product_id, i.release);
+    println!("Connexion    : {transport}");
     println!("Protocole VIA: {}", via.protocol_version()?);
     println!("Couches      : {}", via.layer_count()?);
     println!("Macros       : {} ({} octets)", via.macro_count()?, via.macro_buffer_size()?);

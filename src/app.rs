@@ -187,9 +187,10 @@ impl App {
         match Device::load(&self.def) {
             Ok((dev, texts)) => {
                 self.layer = self.layer.min(dev.layers.saturating_sub(1) as usize);
+                let transport = dev.via.info.transport_label();
                 self.info(format!(
-                    "{} connecté — protocole VIA {}, {} couches",
-                    dev.via.info.product, dev.protocol, dev.layers
+                    "{} connecté ({}) — protocole VIA {}, {} couches",
+                    dev.via.info.product, transport, dev.protocol, dev.layers
                 ));
                 if dev.protocol < 12 {
                     self.error(format!(
@@ -203,10 +204,17 @@ impl App {
             }
             Err(e) => {
                 self.dev = None;
-                self.status = (
-                    format!("Clavier non détecté ({e:#}) — branchez le Flow 2 en USB"),
-                    DIM_TEXT,
-                );
+                let via_found = Via::open(self.def.vendor_id, self.def.product_id);
+                let msg = if let Ok(v) = via_found {
+                    if v.info.is_wireless() {
+                        "Récepteur 2.4G détecté — clavier en veille ou éteint (appuyez sur une touche)".into()
+                    } else {
+                        format!("Flow 2 filaire non prêt ({e:#})")
+                    }
+                } else {
+                    "Flow 2 non détecté — connectez le récepteur 2.4G ou le câble USB".into()
+                };
+                self.status = (msg, DIM_TEXT);
             }
         }
     }
@@ -643,17 +651,52 @@ impl App {
         ui.add_space(8.0);
         let mut changed_brightness = false;
         let mut changed_effect = false;
-        egui::Grid::new("lighting").num_columns(2).spacing(vec2(16.0, 12.0)).show(ui, |ui| {
-            ui.label("Luminosité");
-            let resp = ui.add(egui::Slider::new(&mut brightness, 0..=255).custom_formatter(|v, _| {
-                format!("{:.0} %", v / 255.0 * 100.0)
-            }));
-            changed_brightness = resp.changed();
+
+        ui.label(
+            RichText::new(
+                "Le Flow 2 intègre un rétroéclairage blanc sous chaque touche, piloté directement par son firmware. \
+                 Les réglages sont appliqués en direct au clavier.",
+            )
+            .color(DIM_TEXT),
+        );
+        ui.add_space(10.0);
+
+        egui::Grid::new("lighting").num_columns(2).spacing(vec2(16.0, 14.0)).show(ui, |ui| {
+            ui.label(RichText::new("Luminosité").strong());
+            ui.horizontal(|ui| {
+                let resp = ui.add(egui::Slider::new(&mut brightness, 0..=255).custom_formatter(|v, _| {
+                    format!("{:.0} %", v / 255.0 * 100.0)
+                }));
+                changed_brightness = resp.changed();
+
+                ui.add_space(8.0);
+                for &(label, val) in &[
+                    ("0%", 0u8),
+                    ("25%", 64u8),
+                    ("50%", 128u8),
+                    ("75%", 191u8),
+                    ("100%", 255u8),
+                ] {
+                    if ui.button(label).clicked() {
+                        brightness = val;
+                        changed_brightness = true;
+                    }
+                }
+            });
             ui.end_row();
-            ui.label("Effet");
-            changed_effect = ui.checkbox(&mut breathing, "Respiration").changed();
+
+            ui.label(RichText::new("Effet natif").strong());
+            ui.horizontal(|ui| {
+                if ui.radio_value(&mut breathing, false, "Fixe").changed() {
+                    changed_effect = true;
+                }
+                if ui.radio_value(&mut breathing, true, "Respiration").changed() {
+                    changed_effect = true;
+                }
+            });
             ui.end_row();
         });
+
         if changed_brightness {
             let r = dev.via.custom_set(backlight::CHANNEL, backlight::BRIGHTNESS, brightness);
             if self.check("Luminosité", r).is_some() {
@@ -672,19 +715,20 @@ impl App {
                 }
             }
         }
-        ui.add_space(12.0);
-        if ui.button(RichText::new("Enregistrer dans le clavier").strong()).clicked() {
-            if let Some(dev) = &self.dev {
-                let r = dev.via.custom_save(backlight::CHANNEL);
-                if self.check("Enregistrement", r).is_some() {
-                    self.info("Rétroéclairage enregistré (conservé après débranchement)");
-                }
+
+        ui.add_space(16.0);
+        if ui.button(RichText::new("Enregistrer dans la mémoire du clavier").strong()).clicked() {
+            let Some(dev) = &self.dev else { return };
+            let r = dev.via.custom_save(backlight::CHANNEL);
+            if self.check("Enregistrement du rétroéclairage", r).is_some() {
+                self.info("Rétroéclairage enregistré (conservé après débranchement)");
             }
         }
-        ui.add_space(6.0);
+
+        ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "Les réglages s'appliquent tout de suite ; « Enregistrer » les conserve après débranchement. \
+                "« Enregistrer » sauvegarde la luminosité et le mode dans la mémoire flash permanente du clavier. \
                  Sur la couche Mac, F5/F6 règlent aussi la luminosité.",
             )
             .color(DIM_TEXT),
@@ -712,7 +756,7 @@ impl App {
         ui.horizontal(|ui| {
             let (txt, color) = match (status.device, status.hook) {
                 (true, true) => ("● Slider surveillé", OK),
-                (false, _) => ("● Flow 2 non détecté (USB)", DIM_TEXT),
+                (false, _) => ("● Flow 2 non détecté (USB / 2.4G)", DIM_TEXT),
                 (true, false) => ("● Hook clavier indisponible", ERROR),
             };
             ui.label(RichText::new(txt).color(color));
@@ -973,7 +1017,7 @@ fn not_connected(ui: &mut egui::Ui) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         ui.heading("Flow 2 non détecté");
-        ui.label("Branchez le clavier avec le câble USB.");
+        ui.label("Branchez le clavier avec le câble USB ou son récepteur 2.4G.");
         ui.label(RichText::new("Nouvelle tentative automatique toutes les 2 secondes.").color(DIM_TEXT));
     });
 }

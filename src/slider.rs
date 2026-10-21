@@ -44,13 +44,16 @@ use windows_sys::Win32::{
 use crate::{layer_detect, via::Via};
 
 const CONSUMER_PAGE: u16 = 0x0C;
-const CONSUMER_REPORT_ID: u8 = 4;
+/// Rapports de contrôle consommateur (volume) :
+/// - rapport n°3 sur le récepteur sans fil 2.4G (MI_00 Col 3)
+/// - rapport n°4 en USB filaire (interface 2 Col 3)
+const CONSUMER_REPORT_IDS: [u8; 2] = [3, 4];
 const USAGE_VOLUME_UP: u16 = 0xE9;
 const USAGE_VOLUME_DOWN: u16 = 0xEA;
 const KC_VOLU: u16 = 0xA9;
 const KC_VOLD: u16 = 0xAA;
 /// Attente maximale, dans le hook, du rapport HID correspondant à une touche volume.
-const HOOK_WAIT: Duration = Duration::from_millis(40);
+const HOOK_WAIT: Duration = Duration::from_millis(60);
 /// Au-delà, un appui HID non apparié est périmé.
 const PRESS_MAX_AGE: Duration = Duration::from_millis(200);
 /// Pause qui sépare deux gestes (remet à zéro le compteur de sensibilité).
@@ -309,6 +312,9 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
         shared.keymap_dirty.store(false, Ordering::Relaxed);
         shared.status.lock().unwrap().device = true;
 
+        let mut last_matrix_check = Instant::now() - Duration::from_secs(1);
+        let mut last_matrix_from_slider = false;
+
         loop {
             if shared.keymap_dirty.swap(false, Ordering::Relaxed) {
                 keys = volume_keys(&via, rows, cols);
@@ -318,7 +324,7 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
                 Ok(n) => n,
                 Err(_) => break, // clavier débranché : on se reconnectera
             };
-            if n < 3 || buf[0] != CONSUMER_REPORT_ID {
+            if n < 3 || !CONSUMER_REPORT_IDS.contains(&buf[0]) {
                 continue;
             }
             let dir = match u16::from_le_bytes([buf[1], buf[2]]) {
@@ -328,9 +334,20 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
             };
             // Une touche volume du keymap enfoncée à cet instant : ce n'est pas le slider.
             // Si la matrice ne répond pas, on laisse passer (le volume reste utilisable).
-            let from_slider = via
-                .matrix_state(rows, cols)
-                .is_ok_and(|m| !keys.iter().any(|&i| m.get(i).copied().unwrap_or(false)));
+            // En 2.4G lors d'une rafale de crans du slider, on réutilise l'état lu s'il date de moins de 30 ms.
+            let now = Instant::now();
+            let from_slider = if now.saturating_duration_since(last_matrix_check) < Duration::from_millis(30)
+                && last_matrix_from_slider
+            {
+                true
+            } else {
+                let s = via
+                    .matrix_state(rows, cols)
+                    .is_ok_and(|m| !keys.iter().any(|&i| m.get(i).copied().unwrap_or(false)));
+                last_matrix_check = now;
+                last_matrix_from_slider = s;
+                s
+            };
             let mut presses = shared.presses.lock().unwrap();
             presses.retain(|p| p.at.elapsed() < PRESS_MAX_AGE);
             presses.push_back(Press { at: Instant::now(), dir, from_slider });

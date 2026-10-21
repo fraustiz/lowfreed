@@ -1,13 +1,14 @@
 # Lowfreed
 
-Configurateur Windows en Rust pour le clavier **Lofree Flow 2** (100 %, ANSI-US, USB `388D:0003`).
+Configurateur Windows en Rust pour le clavier **Lofree Flow 2** (100 %, ANSI-US, USB / 2.4G `388D:0003`).
 Il parle directement au clavier par le protocole **VIA** (raw HID), sans navigateur ni logiciel Lofree.
+Compatible en liaison **USB filaire** et **sans fil 2.4 GHz** (dongle USB).
 
 - **Keymap** : les 6 couches, clic sur une touche puis choix de la fonction (basique, pavé numérique,
   média, souris, couches, rétroéclairage, keycodes Lofree, macros, combinaisons, Mod-Tap, Layer-Tap,
   keycode libre). Chaque modification est écrite tout de suite dans le clavier.
 - **Macros** : les 16 macros du firmware, avec la syntaxe de VIA (`{KC_LCTL,KC_C}`, `{250}`…).
-- **Rétroéclairage** : luminosité, respiration, enregistrement permanent.
+- **Rétroéclairage** : luminosité (0–100 %, paliers rapides 0/25/50/75/100 %), modes fixe ou respiration, enregistrement permanent dans le clavier.
 - **Slider** : remplace le volume du slider latéral par une autre action (défilement vertical ou
   horizontal, zoom, onglet suivant/précédent, piste suivante/précédente, flèches), avec inversion du sens
   et sensibilité. F11/F12 et les autres touches volume gardent le volume.
@@ -38,6 +39,7 @@ lowfreed-cli dump [couche]         keymap lisible
 lowfreed-cli macros                contenu des macros
 lowfreed-cli set 1 0 1 KC_F1       assigne un keycode (couche, ligne, colonne)
 lowfreed-cli slider scroll 60      remplace le slider pendant 60 s et affiche chaque cran (diagnostic)
+lowfreed-cli light 255 fixe        règle la luminosité et le mode (fixe ou respiration)
 lowfreed-cli backup sauvegarde.layout.json
 lowfreed-cli restore sauvegarde.layout.json
 ```
@@ -46,11 +48,11 @@ lowfreed-cli restore sauvegarde.layout.json
 
 ## Ce que l'on sait du Flow 2
 
-Relevé sur le clavier branché (firmware révision `0x0016`) :
+Relevé sur le clavier branché (firmware révision `0x0016` filaire, `0x2004` récepteur 2.4G) :
 
 | Élément | Valeur |
 | --- | --- |
-| Interface VIA | USB interface 1, page d'usage `0xFF60`, usage `0x61`, rapports de 32 octets |
+| Interface VIA | USB interface 1 (câble) ou interface 2 (dongle 2.4G), page d'usage `0xFF60`, usage `0x61`, rapports de 32 octets |
 | Protocole | VIA **v12** (keycodes QMK ≥ 0.19) |
 | Couches | 6 : 0 Mac, 1 Fn Mac, 2 Windows, 3 Fn Windows, 4 et 5 « système » |
 | Macros | 16, tampon de 2760 octets |
@@ -58,6 +60,7 @@ Relevé sur le clavier branché (firmware révision `0x0016`) :
 | Keycodes Lofree | `CUSTOM(0…18)` (non documentés, sauf `CUSTOM(0)` = « TRIGGER » dans le JSON). Fn+1…4 utilisent `CUSTOM(1…4)`, F3 de la couche Mac `CUSTOM(11)` |
 
 À savoir :
+- Le récepteur **2.4 GHz** partage le même VID/PID (`388D:0003`) avec la révision `0x2004`. En 2.4G, le protocole VIA complet fonctionne à distance. Lorsque le clavier se met en veille pour économiser sa batterie, appuyer sur n'importe quelle touche le réveille et Lowfreed se reconnecte aussitôt.
 - La **couche 4** (Fn + Maj gauche) contient `QK_BOOT` sur Échap (mode bootloader) et `EE_CLR` sur Retour arrière ;
   l'appli les affiche en rouge. L'appli n'envoie jamais elle-même les commandes bootloader ou effacement EEPROM.
 - Windows transmet les réponses HID à tous les programmes ouverts sur l'interface : si VIA (usevia.app) tourne
@@ -66,7 +69,7 @@ Relevé sur le clavier branché (firmware révision `0x0016`) :
 
 ### Le slider latéral
 
-Le firmware envoie « Volume + / − » (page Consumer, usages `0xE9`/`0xEA`, rapport n°4 de l'interface 2),
+Le firmware envoie « Volume + / − » (page Consumer, usages `0xE9`/`0xEA`, rapport n°4 en USB câble, rapport n°3 en 2.4G),
 et « Luminosité écran ± » (`0x6F`/`0x70`) avec Fn. Ce comportement est figé : le slider n'est ni dans la
 matrice, ni un encodeur VIA, ni une valeur personnalisée. Lowfreed le remplace donc côté Windows :
 
