@@ -1,6 +1,6 @@
 [package]
 name = "lowfreed"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Configurateur du clavier Lofree Flow 2 (protocole VIA)"
 license = "MIT"
