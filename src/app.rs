@@ -19,6 +19,7 @@ use lowfreed::{
     macros,
     slider::{Action, Dir, Engine},
     system::{autostart, Settings},
+    update::{self, Updater},
     via::{backlight, Via},
 };
 
@@ -137,6 +138,8 @@ pub struct App {
     hide_frames: u8,
     /// Dernière couche active détectée et déjà présélectionnée.
     detected_layer: Option<u8>,
+    updater: Updater,
+    show_update_modal: bool,
 }
 
 impl App {
@@ -149,6 +152,8 @@ impl App {
         start_hidden: bool,
     ) -> Self {
         setup_style(&cc.egui_ctx);
+        let updater = Updater::new();
+        updater.check(cc.egui_ctx.clone());
         Self {
             layer: settings.last_layer.unwrap_or(0) as usize,
             detected_layer: None,
@@ -171,6 +176,8 @@ impl App {
             pressed: Vec::new(),
             seen: BTreeSet::new(),
             pending: None,
+            updater,
+            show_update_modal: false,
         }
     }
 
@@ -310,6 +317,36 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Lowfreed").size(20.0).strong().color(ACCENT));
+            ui.label(RichText::new(format!("v{}", update::CURRENT_VERSION)).size(13.0).color(DIM_TEXT));
+
+            match self.updater.status() {
+                update::UpdateStatus::Available { ref version, .. } => {
+                    if ui
+                        .button(RichText::new(format!("⚡ Mise à jour {version} disponible")).color(ACCENT).strong())
+                        .on_hover_text("Cliquez pour voir les détails et installer")
+                        .clicked()
+                    {
+                        self.show_update_modal = true;
+                    }
+                }
+                update::UpdateStatus::Downloading { ref version, progress, .. } => {
+                    ui.label(
+                        RichText::new(format!("⚡ Téléchargement {version} : {:.0} %", progress * 100.0))
+                            .color(ACCENT),
+                    );
+                }
+                update::UpdateStatus::ReadyToRestart { ref version } => {
+                    if ui
+                        .button(RichText::new(format!("✓ {version} installée — Redémarrer")).color(OK).strong())
+                        .on_hover_text("Cliquez pour relancer Lowfreed avec la nouvelle version")
+                        .clicked()
+                    {
+                        let _ = self.updater.restart();
+                    }
+                }
+                _ => {}
+            }
+
             match &self.dev {
                 Some(d) => ui.label(format!(
                     "{}  ·  VIA v{}  ·  {} couches  ·  {} macros",
@@ -847,6 +884,63 @@ impl App {
         ui.label(
             RichText::new("Icône près de l'horloge : clic gauche pour ouvrir, clic droit → Quitter.").color(DIM_TEXT),
         );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(RichText::new("Mises à jour").strong().size(16.0));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(format!("Version installée : v{}", update::CURRENT_VERSION));
+            ui.add_space(8.0);
+            match self.updater.status() {
+                update::UpdateStatus::Idle => {
+                    if ui.button("Vérifier les mises à jour").clicked() {
+                        self.updater.check(ui.ctx().clone());
+                    }
+                }
+                update::UpdateStatus::Checking => {
+                    ui.spinner();
+                    ui.label(RichText::new("Recherche sur GitHub…").color(DIM_TEXT));
+                }
+                update::UpdateStatus::UpToDate => {
+                    ui.label(RichText::new("● À jour").color(OK));
+                    if ui.button("Revérifier").clicked() {
+                        self.updater.check(ui.ctx().clone());
+                    }
+                }
+                update::UpdateStatus::Available { ref version, .. } => {
+                    ui.label(RichText::new(format!("● Version {version} disponible !")).color(ACCENT));
+                    if ui.button(RichText::new("Mettre à jour").strong().color(ACCENT)).clicked() {
+                        self.updater.install(ui.ctx().clone());
+                    }
+                    if ui.button("Voir les nouveautés").clicked() {
+                        self.show_update_modal = true;
+                    }
+                }
+                update::UpdateStatus::Downloading { ref version, progress, downloaded, total } => {
+                    let mb_down = downloaded as f32 / (1024.0 * 1024.0);
+                    let mb_tot = total as f32 / (1024.0 * 1024.0);
+                    ui.label(format!("Téléchargement {version} :"));
+                    ui.add(egui::ProgressBar::new(progress).text(format!("{mb_down:.1} / {mb_tot:.1} Mo")));
+                }
+                update::UpdateStatus::Applying => {
+                    ui.spinner();
+                    ui.label(RichText::new("Installation de la mise à jour…").color(ACCENT));
+                }
+                update::UpdateStatus::ReadyToRestart { ref version } => {
+                    ui.label(RichText::new(format!("● Version {version} installée !")).color(OK));
+                    if ui.button(RichText::new("Redémarrer l'application").strong().color(OK)).clicked() {
+                        let _ = self.updater.restart();
+                    }
+                }
+                update::UpdateStatus::Error(ref e) => {
+                    ui.label(RichText::new(format!("Erreur : {e}")).color(ERROR));
+                    if ui.button("Réessayer").clicked() {
+                        self.updater.check(ui.ctx().clone());
+                    }
+                }
+            }
+        });
     }
 
     fn tester_tab(&mut self, ui: &mut egui::Ui) {
@@ -957,6 +1051,80 @@ impl App {
             }
         }
     }
+
+    fn update_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_update_modal {
+            return;
+        }
+        let status = self.updater.status();
+        let (version, notes, url, is_downloading, progress, is_ready) = match status {
+            update::UpdateStatus::Available { ref version, ref notes, ref url, .. } => {
+                (version.clone(), notes.clone(), url.clone(), false, 0.0, false)
+            }
+            update::UpdateStatus::Downloading { ref version, progress, .. } => {
+                (version.clone(), String::new(), String::new(), true, progress, false)
+            }
+            update::UpdateStatus::ReadyToRestart { ref version } => {
+                (version.clone(), String::new(), String::new(), false, 1.0, true)
+            }
+            _ => {
+                self.show_update_modal = false;
+                return;
+            }
+        };
+
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::unique("update-modal")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            if is_ready {
+                ui.heading(format!("Mise à jour {version} installée !"));
+                ui.add_space(8.0);
+                ui.label("La nouvelle version a été installée avec succès. Redémarrez l'application pour l'appliquer.");
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Redémarrer maintenant").strong().color(OK)).clicked() {
+                        let _ = self.updater.restart();
+                    }
+                    if ui.button("Plus tard").clicked() {
+                        close = true;
+                    }
+                });
+            } else if is_downloading {
+                ui.heading(format!("Téléchargement de {version}…"));
+                ui.add_space(8.0);
+                ui.add(egui::ProgressBar::new(progress).show_percentage());
+                ui.add_space(8.0);
+                ui.label(RichText::new("Veuillez patienter pendant le téléchargement et l'installation.").color(DIM_TEXT));
+            } else {
+                ui.heading(format!("Mise à jour {version} disponible"));
+                ui.add_space(6.0);
+                ui.label(format!("Une nouvelle version de Lowfreed est disponible (version actuelle : v{}).", update::CURRENT_VERSION));
+                if !notes.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Notes de version :").strong());
+                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                        ui.label(RichText::new(&notes).size(12.0));
+                    });
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Installer la mise à jour").strong().color(ACCENT)).clicked() {
+                        self.updater.install(ctx.clone());
+                    }
+                    if !url.is_empty() {
+                        ui.hyperlink_to("Voir sur GitHub", &url);
+                    }
+                    if ui.button("Plus tard").clicked() {
+                        close = true;
+                    }
+                });
+            }
+        });
+
+        if close || resp.should_close() {
+            self.show_update_modal = false;
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1021,6 +1189,7 @@ impl eframe::App for App {
         });
         let ctx = ui.ctx().clone();
         self.pending_modal(&ctx);
+        self.update_modal(&ctx);
     }
 }
 
