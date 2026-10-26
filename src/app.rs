@@ -805,29 +805,40 @@ impl App {
     }
 
     fn slider_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new(
-                "Le slider latéral envoie « Volume + / − » (et « Luminosité écran ± » avec Fn). Ce comportement \
-                 est figé dans le firmware Lofree : VIA ne le voit pas. Lowfreed le remplace donc côté Windows, \
-                 tant qu'il tourne (fenêtre ouverte ou icône dans la zone de notification). \
-                 F11/F12 et les autres touches volume du keymap gardent le volume.",
-            )
-            .color(DIM_TEXT),
-        );
-        ui.add_space(8.0);
+        #[cfg(target_os = "macos")]
+        {
+            ui.label(
+                RichText::new(
+                    "ℹ️ Note macOS : Le slider latéral du Flow 2 n'est pas une touche VIA et n'est pas programmable \
+                     dans la mémoire du clavier. Son comportement « Volume + / − » est codé en dur dans le microcontrôleur Lofree. \
+                     Le remplacement logiciel par détournement de frappes n'est disponible que sous Windows. \
+                     Sur macOS, le slider contrôle toujours nativement le volume sonore.",
+                )
+                .color(ACCENT),
+            );
+            ui.add_space(8.0);
+        }
+        #[cfg(windows)]
+        {
+            ui.label(
+                RichText::new(
+                    "Le slider latéral envoie « Volume + / − » (et « Luminosité écran ± » avec Fn). Ce comportement \
+                     est figé dans le firmware Lofree : VIA ne le voit pas. Lowfreed le remplace donc côté Windows, \
+                     tant qu'il tourne (fenêtre ouverte ou icône dans la zone de notification). \
+                     F11/F12 et les autres touches volume du keymap gardent le volume.",
+                )
+                .color(DIM_TEXT),
+            );
+            ui.add_space(8.0);
+        }
 
         let status = self.engine.status();
         ui.horizontal(|ui| {
             let (txt, color) = match (status.device, status.hook) {
+                _ if cfg!(target_os = "macos") => ("● Non modifiable sur macOS (matériellement figé au volume)", DIM_TEXT),
                 (true, true) => ("● Slider surveillé", OK),
                 (false, _) => ("● Flow 2 non détecté (USB / 2.4G)", DIM_TEXT),
-                (true, false) => {
-                    if cfg!(target_os = "macos") {
-                        ("● Slider actif (rapports HID)", OK)
-                    } else {
-                        ("● Hook clavier indisponible", ERROR)
-                    }
-                }
+                (true, false) => ("● Hook clavier indisponible", ERROR),
             };
             ui.label(RichText::new(txt).color(color));
             if let Some(last) = status.last {
@@ -837,7 +848,9 @@ impl App {
                 let done = if last.replaced { "remplacé" } else { "laissé au volume" };
                 ui.label(RichText::new(format!("dernier : {what} {dir}, {done}, il y a {ago:.0} s")).color(DIM_TEXT));
             }
-            ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
+            if cfg!(windows) {
+                ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
+            }
         });
         ui.ctx().request_repaint_after(Duration::from_millis(300));
         ui.add_space(10.0);
@@ -845,19 +858,21 @@ impl App {
         let mut cfg = self.settings.slider;
         ui.label(RichText::new("Action du slider").strong().size(16.0));
         ui.add_space(4.0);
-        egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
-            for action in Action::ALL {
-                ui.radio_value(&mut cfg.action, action, action.title());
-                ui.label(RichText::new(action.detail()).color(DIM_TEXT));
-                ui.end_row();
-            }
-        });
-        ui.add_space(8.0);
-        ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
-            ui.checkbox(&mut cfg.invert, "Inverser le sens");
-            ui.horizontal(|ui| {
-                ui.label("Sensibilité : une action tous les");
-                ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
+        ui.add_enabled_ui(cfg!(windows), |ui| {
+            egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+                for action in Action::ALL {
+                    ui.radio_value(&mut cfg.action, action, action.title());
+                    ui.label(RichText::new(action.detail()).color(DIM_TEXT));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
+                ui.checkbox(&mut cfg.invert, "Inverser le sens");
+                ui.horizontal(|ui| {
+                    ui.label("Sensibilité : une action tous les");
+                    ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
+                });
             });
         });
         if cfg != self.settings.slider {
