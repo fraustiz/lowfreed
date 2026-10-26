@@ -128,6 +128,7 @@ pub struct App {
     def: Definition,
     dev: Option<Device>,
     connecting: bool,
+    bluetooth_detected: bool,
     connect_tx: Sender<ConnectResult>,
     connect_rx: Receiver<ConnectResult>,
     last_attempt: Option<Instant>,
@@ -181,6 +182,7 @@ impl App {
             def,
             dev: None,
             connecting: false,
+            bluetooth_detected: false,
             connect_tx,
             connect_rx,
             last_attempt: None,
@@ -446,7 +448,7 @@ impl App {
 
     fn keymap_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dev) = &self.dev else {
-            not_connected(ui);
+            not_connected(ui, self.bluetooth_detected);
             return;
         };
         let layers = dev.layers;
@@ -628,7 +630,7 @@ impl App {
 
     fn macros_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dev) = &self.dev else {
-            not_connected(ui);
+            not_connected(ui, self.bluetooth_detected);
             return;
         };
         let size = dev.macro_size as usize;
@@ -702,7 +704,7 @@ impl App {
 
     fn lighting_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dev) = &self.dev else {
-            not_connected(ui);
+            not_connected(ui, self.bluetooth_detected);
             return;
         };
         let Some((mut brightness, effect)) = dev.backlight else {
@@ -970,7 +972,7 @@ impl App {
 
     fn tester_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dev) = &self.dev else {
-            not_connected(ui);
+            not_connected(ui, self.bluetooth_detected);
             return;
         };
         let (rows, cols) = (self.def.matrix.rows, self.def.matrix.cols);
@@ -1196,6 +1198,7 @@ impl eframe::App for App {
             self.connecting = false;
             match res {
                 ConnectResult::Success(dev, texts) => {
+                    self.bluetooth_detected = false;
                     self.layer = self.layer.min(dev.layers.saturating_sub(1) as usize);
                     let transport = dev.via.info.transport_label();
                     self.info(format!(
@@ -1214,6 +1217,7 @@ impl eframe::App for App {
                 }
                 ConnectResult::WirelessSleeping => {
                     self.dev = None;
+                    self.bluetooth_detected = false;
                     self.status = (
                         "Récepteur 2.4G détecté — clavier en veille ou éteint (appuyez sur une touche)".into(),
                         DIM_TEXT,
@@ -1221,10 +1225,12 @@ impl eframe::App for App {
                 }
                 ConnectResult::NotReady(e) => {
                     self.dev = None;
+                    self.bluetooth_detected = false;
                     self.status = (format!("Flow 2 filaire non prêt ({e})"), DIM_TEXT);
                 }
                 ConnectResult::BluetoothDetected => {
                     self.dev = None;
+                    self.bluetooth_detected = true;
                     self.status = (
                         "Flow 2 détecté en Bluetooth — branchez le câble USB ou le dongle 2.4G pour configurer (VIA indisponible en Bluetooth)".into(),
                         DIM_TEXT,
@@ -1232,6 +1238,7 @@ impl eframe::App for App {
                 }
                 ConnectResult::NotFound => {
                     self.dev = None;
+                    self.bluetooth_detected = false;
                     self.status = (
                         "Flow 2 non détecté — connectez le récepteur 2.4G ou le câble USB".into(),
                         DIM_TEXT,
@@ -1269,12 +1276,26 @@ impl eframe::App for App {
     }
 }
 
-fn not_connected(ui: &mut egui::Ui) {
+fn not_connected(ui: &mut egui::Ui, is_bluetooth: bool) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
-        ui.heading("Flow 2 non détecté");
-        ui.label("Branchez le clavier avec le câble USB ou son récepteur 2.4G.");
-        ui.label(RichText::new("Nouvelle tentative automatique toutes les 2 secondes.").color(DIM_TEXT));
+        if is_bluetooth {
+            ui.heading("Flow 2 détecté en Bluetooth");
+            ui.add_space(8.0);
+            ui.label("Le protocole de configuration VIA n'est pas actif en liaison Bluetooth.");
+            ui.add_space(6.0);
+            ui.label("Pour configurer vos touches, macros et rétroéclairage :");
+            ui.add_space(8.0);
+            ui.label(RichText::new("1. Branchez le câble USB-C (et passez le commutateur du clavier sur Câble)").strong());
+            ui.label(RichText::new("— OU —").color(DIM_TEXT));
+            ui.label(RichText::new("2. Branchez le récepteur sans-fil USB 2.4 GHz (dongle Lofree)").strong());
+            ui.add_space(14.0);
+            ui.label(RichText::new("Détection automatique dès le branchement…").color(DIM_TEXT));
+        } else {
+            ui.heading("Flow 2 non détecté");
+            ui.label("Branchez le clavier avec le câble USB ou son récepteur 2.4G.");
+            ui.label(RichText::new("Nouvelle tentative automatique toutes les 2 secondes.").color(DIM_TEXT));
+        }
     });
 }
 

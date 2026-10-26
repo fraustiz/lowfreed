@@ -5,6 +5,8 @@
 //! du Flow 2 au même instant : une touche dont le keycode diffère entre les couches de base
 //! (Alt/Win en bas à gauche, F11/F12…) révèle la couche en service.
 
+#![cfg_attr(not(windows), allow(unused, dead_code))]
+
 use std::{
     collections::HashSet,
     sync::{

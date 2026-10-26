@@ -10,6 +10,8 @@
 //! - un hook clavier bas niveau reçoit la touche virtuelle VK_VOLUME_UP/DOWN que Windows en
 //!   tire, la bloque si elle vient du slider et déclenche l'action choisie.
 
+#![cfg_attr(not(windows), allow(unused, dead_code))]
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -226,27 +228,34 @@ impl Engine {
                 })
             })
             .clone();
-        let (key_tx, key_rx) = mpsc::channel();
-        layer_detect::install(key_tx);
-        let (active, dirty) = (shared.active_layer.clone(), shared.layer_keymap_dirty.clone());
-        thread::Builder::new()
-            .name("layer-detect".into())
-            .spawn(move || layer_detect::run(key_rx, active, dirty, vendor_id, product_id, rows, cols))
-            .expect("fil layer-detect");
-        let s = shared.clone();
-        thread::Builder::new()
-            .name("slider-hid".into())
-            .spawn(move || reader(s, vendor_id, product_id, rows, cols))
-            .expect("fil slider-hid");
-        thread::Builder::new()
-            .name("slider-hook".into())
-            .spawn(hook_thread)
-            .expect("fil slider-hook");
-        let s = shared.clone();
-        thread::Builder::new()
-            .name("slider-action".into())
-            .spawn(move || worker(s, rx))
-            .expect("fil slider-action");
+        #[cfg(windows)]
+        {
+            let (key_tx, key_rx) = mpsc::channel();
+            layer_detect::install(key_tx);
+            let (active, dirty) = (shared.active_layer.clone(), shared.layer_keymap_dirty.clone());
+            thread::Builder::new()
+                .name("layer-detect".into())
+                .spawn(move || layer_detect::run(key_rx, active, dirty, vendor_id, product_id, rows, cols))
+                .expect("fil layer-detect");
+            let s = shared.clone();
+            thread::Builder::new()
+                .name("slider-hid".into())
+                .spawn(move || reader(s, vendor_id, product_id, rows, cols))
+                .expect("fil slider-hid");
+            thread::Builder::new()
+                .name("slider-hook".into())
+                .spawn(hook_thread)
+                .expect("fil slider-hook");
+            let s = shared.clone();
+            thread::Builder::new()
+                .name("slider-action".into())
+                .spawn(move || worker(s, rx))
+                .expect("fil slider-action");
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (vendor_id, product_id, rows, cols, rx);
+        }
         Self { shared }
     }
 
@@ -282,13 +291,24 @@ impl Engine {
 // ─────────────────────────── lecture HID ───────────────────────────
 
 fn open(api: &HidApi, vendor_id: u16, product_id: u16) -> Option<(HidDevice, Via)> {
-    let consumer = api
-        .device_list()
-        .find(|d| d.vendor_id() == vendor_id && d.product_id() == product_id && d.usage_page() == CONSUMER_PAGE)?
-        .open_device(api)
-        .ok()?;
-    let via = Via::open(vendor_id, product_id).ok()?;
-    Some((consumer, via))
+    #[cfg(not(windows))]
+    {
+        // Sur macOS, IOKit impose un accès exclusif par interface IOHIDDevice.
+        // Si le thread du slider ouvre l'interface VIA (interface 1), l'application principale
+        // (App) ne peut plus l'ouvrir (erreur 0xE00002C5 exclusive access).
+        let _ = (api, vendor_id, product_id);
+        None
+    }
+    #[cfg(windows)]
+    {
+        let consumer = api
+            .device_list()
+            .find(|d| d.vendor_id() == vendor_id && d.product_id() == product_id && d.usage_page() == CONSUMER_PAGE)?
+            .open_device(api)
+            .ok()?;
+        let via = Via::open(vendor_id, product_id).ok()?;
+        Some((consumer, via))
+    }
 }
 
 /// Positions de matrice qui portent un keycode de volume, sur n'importe quelle couche.
