@@ -17,8 +17,8 @@ fn main() -> eframe::Result {
     // au démarrage de Windows) ; un JSON charge une autre définition VIA que celle du Flow 2.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let start_hidden = args.iter().any(|a| a == "--tray");
-    args.retain(|a| a != "--tray");
-    let def = match args.first() {
+    args.retain(|a| a != "--tray" && !a.starts_with("-psn"));
+    let def = match args.first().filter(|p| !p.starts_with('-')) {
         Some(path) => {
             let json = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path} : {e}"));
             Definition::parse(&json).unwrap_or_else(|e| panic!("{path} : {e:#}"))

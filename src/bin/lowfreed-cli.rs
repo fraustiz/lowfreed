@@ -42,7 +42,24 @@ fn run(mut args: Vec<String>) -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     };
-    let via = Via::open(def.vendor_id, def.product_id)?;
+    let via = match Via::open(def.vendor_id, def.product_id) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Ok(api) = hidapi::HidApi::new() {
+                if api.device_list().any(|d| {
+                    d.product_string()
+                        .map(|p| p.contains("Flow2") || p.contains("Lofree"))
+                        .unwrap_or(false)
+                }) {
+                    bail!(
+                        "Flow 2 détecté en Bluetooth. Le protocole VIA n'est pas exposé en Bluetooth par le firmware : \
+                         branchez le câble USB ou le récepteur 2.4G pour utiliser lowfreed."
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
     match command {
         "info" => info(&via),
         "dump" => dump(&via, &def, args.get(1).map(|l| l.parse()).transpose()?),

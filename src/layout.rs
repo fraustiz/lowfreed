@@ -49,6 +49,7 @@ pub struct KeyGeom {
     pub h: f32,
 }
 
+#[derive(Clone)]
 pub struct Definition {
     pub name: String,
     pub vendor_id: u16,

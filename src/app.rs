@@ -3,7 +3,10 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::{mpsc::Receiver, Arc},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -113,9 +116,20 @@ enum Pending {
     Import(PathBuf, Backup),
 }
 
+enum ConnectResult {
+    Success(Device, Vec<String>),
+    NotFound,
+    BluetoothDetected,
+    WirelessSleeping,
+    NotReady(String),
+}
+
 pub struct App {
     def: Definition,
     dev: Option<Device>,
+    connecting: bool,
+    connect_tx: Sender<ConnectResult>,
+    connect_rx: Receiver<ConnectResult>,
     last_attempt: Option<Instant>,
     status: (String, Color32),
     tab: Tab,
@@ -152,6 +166,7 @@ impl App {
         start_hidden: bool,
     ) -> Self {
         setup_style(&cc.egui_ctx);
+        let (connect_tx, connect_rx) = mpsc::channel();
         let updater = Updater::new();
         updater.check(cc.egui_ctx.clone());
         Self {
@@ -165,6 +180,9 @@ impl App {
             autostart: autostart::registered(),
             def,
             dev: None,
+            connecting: false,
+            connect_tx,
+            connect_rx,
             last_attempt: None,
             status: ("Recherche du clavier…".into(), DIM_TEXT),
             tab: Tab::Keymap,
@@ -189,41 +207,48 @@ impl App {
         self.status = (msg.into(), ERROR);
     }
 
-    fn connect(&mut self) {
-        self.last_attempt = Some(Instant::now());
-        match Device::load(&self.def) {
-            Ok((dev, texts)) => {
-                self.layer = self.layer.min(dev.layers.saturating_sub(1) as usize);
-                let transport = dev.via.info.transport_label();
-                self.info(format!(
-                    "{} connecté ({}) — protocole VIA {}, {} couches",
-                    dev.via.info.product, transport, dev.protocol, dev.layers
-                ));
-                if dev.protocol < 12 {
-                    self.error(format!(
-                        "Protocole VIA {} : les keycodes avancés peuvent être mal interprétés",
-                        dev.protocol
-                    ));
-                }
-                self.macro_saved = texts.clone();
-                self.macro_texts = texts;
-                self.dev = Some(dev);
-            }
-            Err(e) => {
-                self.dev = None;
-                let via_found = Via::open(self.def.vendor_id, self.def.product_id);
-                let msg = if let Ok(v) = via_found {
-                    if v.info.is_wireless() {
-                        "Récepteur 2.4G détecté — clavier en veille ou éteint (appuyez sur une touche)".into()
-                    } else {
-                        format!("Flow 2 filaire non prêt ({e:#})")
-                    }
-                } else {
-                    "Flow 2 non détecté — connectez le récepteur 2.4G ou le câble USB".into()
-                };
-                self.status = (msg, DIM_TEXT);
-            }
+    fn connect(&mut self, ctx: &egui::Context) {
+        if self.connecting {
+            return;
         }
+        self.connecting = true;
+        self.last_attempt = Some(Instant::now());
+        let def = self.def.clone();
+        let tx = self.connect_tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("device-connect".into())
+            .spawn(move || {
+                let res = match Device::load(&def) {
+                    Ok((dev, texts)) => ConnectResult::Success(dev, texts),
+                    Err(e) => {
+                        let via_found = Via::open(def.vendor_id, def.product_id);
+                        match via_found {
+                            Ok(v) if v.info.is_wireless() => ConnectResult::WirelessSleeping,
+                            Ok(_) => ConnectResult::NotReady(format!("{e:#}")),
+                            Err(_) => {
+                                let has_bt = hidapi::HidApi::new()
+                                    .map(|api| {
+                                        api.device_list().any(|d| {
+                                            d.product_string()
+                                                .map(|p| p.contains("Flow2") || p.contains("Lofree"))
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if has_bt {
+                                    ConnectResult::BluetoothDetected
+                                } else {
+                                    ConnectResult::NotFound
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = tx.send(res);
+                egui_ctx.request_repaint();
+            })
+            .expect("spawn device-connect");
     }
 
     /// Affiche l'erreur d'une opération ; se déconnecte si le clavier ne répond plus.
@@ -378,7 +403,7 @@ impl App {
                     self.export();
                 }
                 if ui.button("Recharger").on_hover_text("Relit tout depuis le clavier").clicked() {
-                    self.connect();
+                    self.connect(ui.ctx());
                 }
             });
         });
@@ -1045,7 +1070,7 @@ impl App {
                 let r = backup.write(&dev.via, &self.def);
                 if self.check("Import", r).is_some() {
                     self.engine.keymap_changed();
-                    self.connect();
+                    self.connect(ctx);
                     self.info(format!("Sauvegarde importée : {}", path.display()));
                 }
             }
@@ -1167,8 +1192,59 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.dev.is_none() && self.last_attempt.is_none_or(|t| t.elapsed() >= RECONNECT_EVERY) {
-            self.connect();
+        while let Ok(res) = self.connect_rx.try_recv() {
+            self.connecting = false;
+            match res {
+                ConnectResult::Success(dev, texts) => {
+                    self.layer = self.layer.min(dev.layers.saturating_sub(1) as usize);
+                    let transport = dev.via.info.transport_label();
+                    self.info(format!(
+                        "{} connecté ({}) — protocole VIA {}, {} couches",
+                        dev.via.info.product, transport, dev.protocol, dev.layers
+                    ));
+                    if dev.protocol < 12 {
+                        self.error(format!(
+                            "Protocole VIA {} : les keycodes avancés peuvent être mal interprétés",
+                            dev.protocol
+                        ));
+                    }
+                    self.macro_saved = texts.clone();
+                    self.macro_texts = texts;
+                    self.dev = Some(dev);
+                }
+                ConnectResult::WirelessSleeping => {
+                    self.dev = None;
+                    self.status = (
+                        "Récepteur 2.4G détecté — clavier en veille ou éteint (appuyez sur une touche)".into(),
+                        DIM_TEXT,
+                    );
+                }
+                ConnectResult::NotReady(e) => {
+                    self.dev = None;
+                    self.status = (format!("Flow 2 filaire non prêt ({e})"), DIM_TEXT);
+                }
+                ConnectResult::BluetoothDetected => {
+                    self.dev = None;
+                    self.status = (
+                        "Flow 2 détecté en Bluetooth — branchez le câble USB ou le dongle 2.4G pour configurer (VIA indisponible en Bluetooth)".into(),
+                        DIM_TEXT,
+                    );
+                }
+                ConnectResult::NotFound => {
+                    self.dev = None;
+                    self.status = (
+                        "Flow 2 non détecté — connectez le récepteur 2.4G ou le câble USB".into(),
+                        DIM_TEXT,
+                    );
+                }
+            }
+        }
+
+        if self.dev.is_none()
+            && !self.connecting
+            && self.last_attempt.is_none_or(|t| t.elapsed() >= RECONNECT_EVERY)
+        {
+            self.connect(ui.ctx());
         }
         if self.dev.is_none() {
             ui.ctx().request_repaint_after(RECONNECT_EVERY);
