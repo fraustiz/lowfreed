@@ -469,15 +469,24 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
 }
 
 #[cfg(target_os = "macos")]
+static TAP_PORT: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn tap_callback(
-    proxy: macos_events::CGEventTapProxy,
+    _proxy: macos_events::CGEventTapProxy,
     etype: u32,
     event: macos_events::CGEventRef,
     _refcon: *mut std::ffi::c_void,
 ) -> macos_events::CGEventRef {
     use macos_events::*;
-    if etype == 0x1C || etype == 0xFFFFFFFE {
-        CGEventTapEnable(proxy as CFMachPortRef, true);
+    use std::sync::atomic::Ordering;
+
+    if etype == 0x1C || etype == 0xFFFFFFFE || etype == 0xFFFFFFFF {
+        let port = TAP_PORT.load(Ordering::SeqCst);
+        if !port.is_null() {
+            CGEventTapEnable(port as CFMachPortRef, true);
+        }
         return event;
     }
     if etype == NX_SYSDEFINED {
@@ -487,11 +496,11 @@ unsafe extern "C" fn tap_callback(
         let sel_data1 = sel_registerName(b"data1\0".as_ptr());
 
         let f_send_1: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
-            std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"objc_msgSend\0".as_ptr() as _));
+            std::mem::transmute(objc_msgSend as *const ());
         let f_send_i16: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i16 =
-            std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"objc_msgSend\0".as_ptr() as _));
+            std::mem::transmute(objc_msgSend as *const ());
         let f_send_isize: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> isize =
-            std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"objc_msgSend\0".as_ptr() as _));
+            std::mem::transmute(objc_msgSend as *const ());
 
         let ns_event = f_send_1(cls_nsevent, sel_from_cg, event);
         if !ns_event.is_null() {
@@ -525,6 +534,14 @@ unsafe extern "C" fn tap_callback(
                         }
                         // Avaler l'événement : macOS ne change pas le volume et n'affiche pas la jauge HUD
                         return std::ptr::null_mut();
+                    } else if is_down {
+                        let mut status = shared.status.lock().unwrap();
+                        status.last = Some(LastEvent {
+                            at: Instant::now(),
+                            dir,
+                            from_slider: true,
+                            replaced: false,
+                        });
                     }
                 }
             }
@@ -536,6 +553,8 @@ unsafe extern "C" fn tap_callback(
 #[cfg(target_os = "macos")]
 fn hook_thread() {
     use macos_events::*;
+    use std::sync::atomic::Ordering;
+
     loop {
         let is_trusted = unsafe { AXIsProcessTrusted() };
         if let Some(shared) = SHARED.get() {
@@ -568,33 +587,36 @@ fn hook_thread() {
         }
 
         let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), port, 0) };
-        let mode_common = unsafe {
-            libc::dlsym(libc::RTLD_DEFAULT, b"kCFRunLoopCommonModes\0".as_ptr() as _) as *const CFStringRef
-        };
-        let mode = unsafe { *mode_common };
+        let common = unsafe { kCFRunLoopCommonModes };
+        let default_mode = unsafe { kCFRunLoopDefaultMode };
         let rl = unsafe { CFRunLoopGetCurrent() };
         unsafe {
-            CFRunLoopAddSource(rl, source, mode);
+            CFRunLoopAddSource(rl, source, common);
             CGEventTapEnable(port, true);
         }
+        TAP_PORT.store(port.cast(), Ordering::SeqCst);
 
         if let Some(shared) = SHARED.get() {
             shared.status.lock().unwrap().hook = true;
         }
 
         loop {
-            let res = unsafe { CFRunLoopRunInMode(mode, 1.0, false) };
-            if res != 0 || !unsafe { AXIsProcessTrusted() } {
+            let res = unsafe { CFRunLoopRunInMode(default_mode, 1.0, false) };
+            if res == 1 || res == 2 || !unsafe { AXIsProcessTrusted() } {
                 break;
             }
         }
 
+        TAP_PORT.store(std::ptr::null_mut(), Ordering::SeqCst);
+        if let Some(shared) = SHARED.get() {
+            shared.status.lock().unwrap().hook = false;
+        }
         unsafe {
             CGEventTapEnable(port, false);
             CFRelease(source.cast());
             CFRelease(port.cast());
         }
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -839,8 +861,12 @@ pub mod macos_events {
         pub fn CGEventPost(tap: u32, event: CGEventRef);
         pub fn CFRelease(cf: *const c_void);
 
+        pub static kCFRunLoopCommonModes: CFStringRef;
+        pub static kCFRunLoopDefaultMode: CFStringRef;
+
         pub fn objc_getClass(name: *const u8) -> *mut c_void;
         pub fn sel_registerName(name: *const u8) -> *mut c_void;
+        pub fn objc_msgSend();
     }
 
     pub unsafe fn post_scroll(delta_y: i32, delta_x: i32, flags: u64) {
