@@ -9,12 +9,18 @@ repository = "https://github.com/fraustiz/lowfreed"
 [dependencies]
 anyhow = "1"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
-hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tray-icon = "0.26"
+
+[target.'cfg(windows)'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(not(windows))'.dependencies]
+hidapi = { version = "2.6" }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

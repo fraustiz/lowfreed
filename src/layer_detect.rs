@@ -32,6 +32,7 @@ pub(crate) fn install(tx: Sender<KeyDown>) {
 }
 
 /// Appelée par le hook clavier pour chaque appui physique (ne bloque pas).
+#[allow(dead_code)]
 pub(crate) fn on_key_down(scan_code: u32, extended: bool) {
     if let Some(tx) = EVENTS.get() {
         let scan = (scan_code as u16 & 0xFF) | if extended { 0xE000 } else { 0 };

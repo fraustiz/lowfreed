@@ -1350,6 +1350,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "hidapi",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

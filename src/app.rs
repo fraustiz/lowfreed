@@ -757,7 +757,13 @@ impl App {
             let (txt, color) = match (status.device, status.hook) {
                 (true, true) => ("● Slider surveillé", OK),
                 (false, _) => ("● Flow 2 non détecté (USB / 2.4G)", DIM_TEXT),
-                (true, false) => ("● Hook clavier indisponible", ERROR),
+                (true, false) => {
+                    if cfg!(target_os = "macos") {
+                        ("● Slider actif (rapports HID)", OK)
+                    } else {
+                        ("● Hook clavier indisponible", ERROR)
+                    }
+                }
             };
             ui.label(RichText::new(txt).color(color));
             if let Some(last) = status.last {
@@ -811,8 +817,13 @@ impl App {
         }
         let current = autostart::command().ok();
         let mut enabled = self.autostart.is_some();
+        let autostart_label = if cfg!(target_os = "macos") {
+            "Lancer Lowfreed à l'ouverture de session macOS (LaunchAgent)"
+        } else {
+            "Lancer Lowfreed au démarrage de Windows, dans la zone de notification"
+        };
         if ui
-            .checkbox(&mut enabled, "Lancer Lowfreed au démarrage de Windows, dans la zone de notification")
+            .checkbox(&mut enabled, autostart_label)
             .changed()
         {
             let r = autostart::set(enabled);

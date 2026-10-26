@@ -12,7 +12,6 @@
 
 use std::{
     collections::VecDeque,
-    ptr::null,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -24,6 +23,10 @@ use std::{
 
 use hidapi::{HidApi, HidDevice};
 use serde::{Deserialize, Serialize};
+
+#[cfg(windows)]
+use std::ptr::null;
+#[cfg(windows)]
 use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
@@ -53,6 +56,7 @@ const USAGE_VOLUME_DOWN: u16 = 0xEA;
 const KC_VOLU: u16 = 0xA9;
 const KC_VOLD: u16 = 0xAA;
 /// Attente maximale, dans le hook, du rapport HID correspondant à une touche volume.
+#[allow(dead_code)]
 const HOOK_WAIT: Duration = Duration::from_millis(60);
 /// Au-delà, un appui HID non apparié est périmé.
 const PRESS_MAX_AGE: Duration = Duration::from_millis(200);
@@ -167,7 +171,9 @@ pub struct Status {
 
 struct Press {
     at: Instant,
+    #[allow(dead_code)]
     dir: Dir,
+    #[allow(dead_code)]
     from_slider: bool,
 }
 
@@ -178,6 +184,7 @@ struct Shared {
     status: Mutex<Status>,
     keymap_dirty: AtomicBool,
     /// Touche volume dont l'appui a été bloqué : on bloque aussi son relâchement.
+    #[allow(dead_code)]
     swallowed: [AtomicBool; 2],
     actions: Mutex<Sender<Dir>>,
     /// Couche de base en service, déduite par [`layer_detect`].
@@ -354,6 +361,23 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
             drop(presses);
             shared.arrived.notify_all();
             shared.hid_volume.fetch_add(1, Ordering::Relaxed);
+
+            #[cfg(not(windows))]
+            {
+                let hook_active = shared.status.lock().unwrap().hook;
+                if !hook_active && from_slider && shared.config.lock().unwrap().action != Action::Volume {
+                    let mut status = shared.status.lock().unwrap();
+                    status.last = Some(LastEvent {
+                        at: Instant::now(),
+                        dir,
+                        from_slider,
+                        replaced: true,
+                    });
+                    status.replaced += 1;
+                    drop(status);
+                    let _ = shared.actions.lock().unwrap().send(dir);
+                }
+            }
         }
         shared.status.lock().unwrap().device = false;
     }
@@ -361,6 +385,7 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
 
 // ─────────────────────────── hook clavier ───────────────────────────
 
+#[cfg(windows)]
 fn hook_thread() {
     // SAFETY : appels Win32 classiques ; le hook vit tant que ce fil pompe ses messages.
     unsafe {
@@ -376,6 +401,7 @@ fn hook_thread() {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code == HC_ACTION as i32 {
         // SAFETY : pour WH_KEYBOARD_LL, lparam pointe sur un KBDLLHOOKSTRUCT valide.
@@ -409,8 +435,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: usize, lparam: isize) -> 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
+#[cfg(not(windows))]
+fn hook_thread() {
+    if let Some(shared) = SHARED.get() {
+        shared.status.lock().unwrap().hook = false;
+    }
+}
+
 impl Shared {
     /// Décide si une touche volume doit être bloquée (et déclenche l'action de remplacement).
+    #[allow(dead_code)]
     fn filter(&self, dir: Dir, down: bool) -> bool {
         let slot = &self.swallowed[dir as usize];
         if !down {
@@ -490,6 +524,7 @@ impl Gesture {
     }
 }
 
+#[cfg(windows)]
 fn key(vk: VIRTUAL_KEY, up: bool, extended: bool) -> INPUT {
     let mut flags = if up { KEYEVENTF_KEYUP } else { 0 };
     if extended {
@@ -503,6 +538,7 @@ fn key(vk: VIRTUAL_KEY, up: bool, extended: bool) -> INPUT {
     }
 }
 
+#[cfg(windows)]
 fn wheel(horizontal: bool, delta: i32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
@@ -519,10 +555,12 @@ fn wheel(horizontal: bool, delta: i32) -> INPUT {
     }
 }
 
+#[cfg(windows)]
 fn tap(vk: VIRTUAL_KEY, extended: bool) -> Vec<INPUT> {
     vec![key(vk, false, extended), key(vk, true, extended)]
 }
 
+#[cfg(windows)]
 fn perform(action: Action, dir: Dir) {
     let up = dir == Dir::Up;
     let delta = if up { 120 } else { -120 };
@@ -551,6 +589,110 @@ fn perform(action: Action, dir: Dir) {
         SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
     }
 }
+
+#[cfg(target_os = "macos")]
+mod macos_events {
+    use std::ffi::c_void;
+
+    pub type CGEventRef = *mut c_void;
+    pub type CGEventSourceRef = *mut c_void;
+    pub type CGKeyCode = u16;
+
+    pub const K_CG_HID_EVENT_TAP: u32 = 0;
+    pub const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+    pub const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    pub const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 1 << 17;
+
+    pub const KEY_LEFT_ARROW: CGKeyCode = 0x7B;
+    pub const KEY_RIGHT_ARROW: CGKeyCode = 0x7C;
+    pub const KEY_BRACKET_LEFT: CGKeyCode = 0x21;  // '['
+    pub const KEY_BRACKET_RIGHT: CGKeyCode = 0x1E; // ']'
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        pub fn CGEventCreateKeyboardEvent(
+            source: CGEventSourceRef,
+            virtual_key: CGKeyCode,
+            key_down: bool,
+        ) -> CGEventRef;
+        pub fn CGEventCreateScrollWheelEvent2(
+            source: CGEventSourceRef,
+            units: u32,
+            wheel_count: u32,
+            wheel1: i32,
+            wheel2: i32,
+            wheel3: i32,
+        ) -> CGEventRef;
+        pub fn CGEventSetFlags(event: CGEventRef, flags: u64);
+        pub fn CGEventPost(tap: u32, event: CGEventRef);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub fn CFRelease(cf: *const c_void);
+    }
+
+    pub unsafe fn post_scroll(delta_y: i32, delta_x: i32, flags: u64) {
+        let ev = CGEventCreateScrollWheelEvent2(
+            std::ptr::null_mut(),
+            K_CG_SCROLL_EVENT_UNIT_LINE,
+            if delta_x != 0 { 2 } else { 1 },
+            delta_y,
+            delta_x,
+            0,
+        );
+        if !ev.is_null() {
+            if flags != 0 {
+                CGEventSetFlags(ev, flags);
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, ev);
+            CFRelease(ev.cast());
+        }
+    }
+
+    pub unsafe fn post_key(key: CGKeyCode, flags: u64) {
+        let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), key, true);
+        let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), key, false);
+        if !down.is_null() && !up.is_null() {
+            if flags != 0 {
+                CGEventSetFlags(down, flags);
+                CGEventSetFlags(up, flags);
+            }
+            CGEventPost(K_CG_HID_EVENT_TAP, down);
+            CGEventPost(K_CG_HID_EVENT_TAP, up);
+            CFRelease(down.cast());
+            CFRelease(up.cast());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn perform(action: Action, dir: Dir) {
+    use macos_events::*;
+    let up = dir == Dir::Up;
+    let delta = if up { 3 } else { -3 };
+    unsafe {
+        match action {
+            Action::Volume => {}
+            Action::Scroll => post_scroll(delta, 0, 0),
+            Action::HScroll => post_scroll(0, delta, 0),
+            Action::Zoom => post_scroll(delta, 0, K_CG_EVENT_FLAG_MASK_COMMAND),
+            Action::Tabs => {
+                let key = if up { KEY_BRACKET_RIGHT } else { KEY_BRACKET_LEFT };
+                post_key(key, K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT);
+            }
+            Action::Tracks => {}
+            Action::Arrows => {
+                let key = if up { KEY_RIGHT_ARROW } else { KEY_LEFT_ARROW };
+                post_key(key, 0);
+            }
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn perform(_action: Action, _dir: Dir) {}
 
 #[cfg(test)]
 mod tests {
