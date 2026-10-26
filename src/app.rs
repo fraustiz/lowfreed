@@ -809,12 +809,10 @@ impl App {
         {
             ui.label(
                 RichText::new(
-                    "ℹ️ Note macOS : Le slider latéral du Flow 2 n'est pas une touche VIA et n'est pas programmable \
-                     dans la mémoire du clavier. Son comportement « Volume + / − » est codé en dur dans le microcontrôleur Lofree. \
-                     Le remplacement logiciel par détournement de frappes n'est disponible que sous Windows. \
-                     Sur macOS, le slider contrôle toujours nativement le volume sonore.",
+                    "Le slider latéral du Flow 2 envoie « Volume + / − » (figé dans le firmware Lofree). \
+                     Lowfreed l'intercepte via l'Accessibilité macOS pour le remplacer par l'action de votre choix tant que l'application tourne.",
                 )
-                .color(ACCENT),
+                .color(DIM_TEXT),
             );
             ui.add_space(8.0);
         }
@@ -833,14 +831,29 @@ impl App {
         }
 
         let status = self.engine.status();
+        let trusted = lowfreed::slider::is_accessibility_trusted();
+
         ui.horizontal(|ui| {
             let (txt, color) = match (status.device, status.hook) {
-                _ if cfg!(target_os = "macos") => ("● Non modifiable sur macOS (matériellement figé au volume)", DIM_TEXT),
+                #[cfg(target_os = "macos")]
+                _ if trusted && status.hook => ("● Interception active (Accessibilité accordée)", OK),
+                #[cfg(target_os = "macos")]
+                _ if !trusted => ("● Autorisation d'Accessibilité requise", ACCENT),
                 (true, true) => ("● Slider surveillé", OK),
                 (false, _) => ("● Flow 2 non détecté (USB / 2.4G)", DIM_TEXT),
                 (true, false) => ("● Hook clavier indisponible", ERROR),
             };
             ui.label(RichText::new(txt).color(color));
+            #[cfg(target_os = "macos")]
+            if !trusted {
+                if ui
+                    .button("Autoriser dans Réglages Système…")
+                    .on_hover_text("Ouvre Réglages Système > Confidentialité et sécurité > Accessibilité")
+                    .clicked()
+                {
+                    lowfreed::slider::open_accessibility_settings();
+                }
+            }
             if let Some(last) = status.last {
                 let ago = last.at.elapsed().as_secs_f32();
                 let dir = if last.dir == Dir::Up { "+" } else { "−" };
@@ -848,9 +861,7 @@ impl App {
                 let done = if last.replaced { "remplacé" } else { "laissé au volume" };
                 ui.label(RichText::new(format!("dernier : {what} {dir}, {done}, il y a {ago:.0} s")).color(DIM_TEXT));
             }
-            if cfg!(windows) {
-                ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
-            }
+            ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
         });
         ui.ctx().request_repaint_after(Duration::from_millis(300));
         ui.add_space(10.0);
@@ -858,21 +869,19 @@ impl App {
         let mut cfg = self.settings.slider;
         ui.label(RichText::new("Action du slider").strong().size(16.0));
         ui.add_space(4.0);
-        ui.add_enabled_ui(cfg!(windows), |ui| {
-            egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
-                for action in Action::ALL {
-                    ui.radio_value(&mut cfg.action, action, action.title());
-                    ui.label(RichText::new(action.detail()).color(DIM_TEXT));
-                    ui.end_row();
-                }
-            });
-            ui.add_space(8.0);
-            ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
-                ui.checkbox(&mut cfg.invert, "Inverser le sens");
-                ui.horizontal(|ui| {
-                    ui.label("Sensibilité : une action tous les");
-                    ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
-                });
+        egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+            for action in Action::ALL {
+                ui.radio_value(&mut cfg.action, action, action.title());
+                ui.label(RichText::new(action.detail()).color(DIM_TEXT));
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+        ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
+            ui.checkbox(&mut cfg.invert, "Inverser le sens");
+            ui.horizontal(|ui| {
+                ui.label("Sensibilité : une action tous les");
+                ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
             });
         });
         if cfg != self.settings.slider {
