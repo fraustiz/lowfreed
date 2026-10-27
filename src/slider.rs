@@ -55,6 +55,8 @@ const CONSUMER_PAGE: u16 = 0x0C;
 const CONSUMER_REPORT_IDS: [u8; 2] = [3, 4];
 const USAGE_VOLUME_UP: u16 = 0xE9;
 const USAGE_VOLUME_DOWN: u16 = 0xEA;
+const USAGE_BRIGHTNESS_UP: u16 = 0x6F;
+const USAGE_BRIGHTNESS_DOWN: u16 = 0x70;
 const KC_VOLU: u16 = 0xA9;
 const KC_VOLD: u16 = 0xAA;
 /// Attente maximale, dans le hook, du rapport HID correspondant à une touche volume.
@@ -69,9 +71,13 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Ce que fait le slider.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Action {
-    /// Comportement d'origine : rien n'est intercepté.
+    /// Comportement d'origine : réglage du volume.
     #[default]
     Volume,
+    /// Comportement d'origine avec Fn : réglage de la luminosité de l'écran.
+    Brightness,
+    /// Barre désactivée (unbind) : l'appui est intercepté et bloqué sans action.
+    None,
     Scroll,
     HScroll,
     Zoom,
@@ -81,8 +87,33 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 7] = [
+    pub const ALL_NORMAL: [Action; 8] = [
         Action::Volume,
+        Action::None,
+        Action::Scroll,
+        Action::HScroll,
+        Action::Zoom,
+        Action::Tabs,
+        Action::Tracks,
+        Action::Arrows,
+    ];
+
+    pub const ALL_FN: [Action; 9] = [
+        Action::Brightness,
+        Action::None,
+        Action::Volume,
+        Action::Scroll,
+        Action::HScroll,
+        Action::Zoom,
+        Action::Tabs,
+        Action::Tracks,
+        Action::Arrows,
+    ];
+
+    pub const ALL: [Action; 9] = [
+        Action::Volume,
+        Action::Brightness,
+        Action::None,
         Action::Scroll,
         Action::HScroll,
         Action::Zoom,
@@ -94,6 +125,8 @@ impl Action {
     pub fn title(self) -> &'static str {
         match self {
             Action::Volume => "Volume (d'origine)",
+            Action::Brightness => "Luminosité (d'origine avec Fn)",
+            Action::None => "Désactivée (unbind)",
             Action::Scroll => "Défilement vertical",
             Action::HScroll => "Défilement horizontal",
             Action::Zoom => "Zoom",
@@ -105,7 +138,9 @@ impl Action {
 
     pub fn detail(self) -> &'static str {
         match self {
-            Action::Volume => "Le slider règle le volume de Windows, comme sans Lowfreed.",
+            Action::Volume => "Le slider règle le volume sonore du système.",
+            Action::Brightness => "Règle la luminosité de l'écran du système.",
+            Action::None => "Désactive la barre : aucun changement de volume/luminosité, aucun défilement.",
             Action::Scroll => "Comme la molette de la souris, sous le pointeur.",
             Action::HScroll => "Molette horizontale, sous le pointeur.",
             Action::Zoom => "Ctrl + molette : navigateur, documents, images…",
@@ -120,19 +155,39 @@ impl Action {
 #[serde(default)]
 pub struct SliderConfig {
     pub action: Action,
-    /// Inverse le sens du slider.
+    /// Inverse le sens du slider seul.
     pub invert: bool,
     /// Nombre de crans du slider par action (1 = chaque cran).
     pub step: u8,
+    /// Action quand la touche Fn est maintenue.
+    pub fn_action: Action,
+    /// Inverse le sens du slider avec Fn.
+    pub fn_invert: bool,
+    /// Sensibilité du slider avec Fn.
+    pub fn_step: u8,
 }
 
 impl Default for SliderConfig {
     fn default() -> Self {
-        Self { action: Action::Volume, invert: false, step: 1 }
+        Self {
+            action: Action::Volume,
+            invert: false,
+            step: 1,
+            fn_action: Action::Brightness,
+            fn_invert: false,
+            fn_step: 1,
+        }
     }
 }
 
-/// Sens du slider : `Up` correspond au « Volume + » d'origine.
+/// Événement émis par le slider (sens et maintien de Fn).
+#[derive(Clone, Copy, Debug)]
+pub struct SliderEvent {
+    pub dir: Dir,
+    pub is_fn: bool,
+}
+
+/// Sens du slider : `Up` correspond au « Volume + » ou « Luminosité + ».
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
     Up,
@@ -155,6 +210,7 @@ pub struct LastEvent {
     /// `true` : slider ; `false` : touche volume du keymap (laissée passer).
     pub from_slider: bool,
     pub replaced: bool,
+    pub is_fn: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,6 +233,8 @@ struct Press {
     dir: Dir,
     #[allow(dead_code)]
     from_slider: bool,
+    #[allow(dead_code)]
+    is_fn: bool,
 }
 
 struct Shared {
@@ -188,7 +246,7 @@ struct Shared {
     /// Touche volume dont l'appui a été bloqué : on bloque aussi son relâchement.
     #[allow(dead_code)]
     swallowed: [AtomicBool; 2],
-    actions: Mutex<Sender<Dir>>,
+    actions: Mutex<Sender<SliderEvent>>,
     /// Couche de base en service, déduite par [`layer_detect`].
     active_layer: Arc<Mutex<Option<u8>>>,
     layer_keymap_dirty: Arc<AtomicBool>,
@@ -367,9 +425,11 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
             if n < 3 || !CONSUMER_REPORT_IDS.contains(&buf[0]) {
                 continue;
             }
-            let dir = match u16::from_le_bytes([buf[1], buf[2]]) {
-                USAGE_VOLUME_UP => Dir::Up,
-                USAGE_VOLUME_DOWN => Dir::Down,
+            let (dir, is_fn) = match u16::from_le_bytes([buf[1], buf[2]]) {
+                USAGE_VOLUME_UP => (Dir::Up, false),
+                USAGE_VOLUME_DOWN => (Dir::Down, false),
+                USAGE_BRIGHTNESS_UP => (Dir::Up, true),
+                USAGE_BRIGHTNESS_DOWN => (Dir::Down, true),
                 _ => continue,
             };
             // Une touche volume du keymap enfoncée à cet instant : ce n'est pas le slider.
@@ -390,7 +450,7 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
             };
             let mut presses = shared.presses.lock().unwrap();
             presses.retain(|p| p.at.elapsed() < PRESS_MAX_AGE);
-            presses.push_back(Press { at: Instant::now(), dir, from_slider });
+            presses.push_back(Press { at: Instant::now(), dir, from_slider, is_fn });
             drop(presses);
             shared.arrived.notify_all();
             shared.hid_volume.fetch_add(1, Ordering::Relaxed);
@@ -398,17 +458,26 @@ fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: 
             #[cfg(not(windows))]
             {
                 let hook_active = shared.status.lock().unwrap().hook;
-                if !hook_active && from_slider && shared.config.lock().unwrap().action != Action::Volume {
-                    let mut status = shared.status.lock().unwrap();
-                    status.last = Some(LastEvent {
-                        at: Instant::now(),
-                        dir,
-                        from_slider,
-                        replaced: true,
-                    });
-                    status.replaced += 1;
-                    drop(status);
-                    let _ = shared.actions.lock().unwrap().send(dir);
+                if !hook_active && from_slider {
+                    let config = *shared.config.lock().unwrap();
+                    let (action, is_native) = if is_fn {
+                        (config.fn_action, config.fn_action == Action::Brightness)
+                    } else {
+                        (config.action, config.action == Action::Volume)
+                    };
+                    if !is_native {
+                        let mut status = shared.status.lock().unwrap();
+                        status.last = Some(LastEvent {
+                            at: Instant::now(),
+                            dir,
+                            from_slider,
+                            replaced: true,
+                            is_fn,
+                        });
+                        status.replaced += 1;
+                        drop(status);
+                        let _ = shared.actions.lock().unwrap().send(SliderEvent { dir, is_fn });
+                    }
                 }
             }
         }
@@ -511,15 +580,23 @@ unsafe extern "C" fn tap_callback(
                 let key_flags = (data1 as u32) & 0x0000FFFF;
                 let is_down = (key_flags & 0xFF00) == 0x0A00;
 
-                let dir = match key_code {
-                    NX_KEYTYPE_SOUND_UP => Some(Dir::Up),
-                    NX_KEYTYPE_SOUND_DOWN => Some(Dir::Down),
-                    _ => None,
+                let (dir, is_fn) = match key_code {
+                    NX_KEYTYPE_SOUND_UP => (Some(Dir::Up), false),
+                    NX_KEYTYPE_SOUND_DOWN => (Some(Dir::Down), false),
+                    NX_KEYTYPE_BRIGHTNESS_UP => (Some(Dir::Up), true),
+                    NX_KEYTYPE_BRIGHTNESS_DOWN => (Some(Dir::Down), true),
+                    _ => (None, false),
                 };
 
                 if let (Some(dir), Some(shared)) = (dir, SHARED.get()) {
                     let config = *shared.config.lock().unwrap();
-                    if config.action != Action::Volume {
+                    let (action, is_native) = if is_fn {
+                        (config.fn_action, config.fn_action == Action::Brightness)
+                    } else {
+                        (config.action, config.action == Action::Volume)
+                    };
+
+                    if !is_native {
                         if is_down {
                             let mut status = shared.status.lock().unwrap();
                             status.last = Some(LastEvent {
@@ -527,12 +604,13 @@ unsafe extern "C" fn tap_callback(
                                 dir,
                                 from_slider: true,
                                 replaced: true,
+                                is_fn,
                             });
                             status.replaced += 1;
                             drop(status);
-                            let _ = shared.actions.lock().unwrap().send(dir);
+                            let _ = shared.actions.lock().unwrap().send(SliderEvent { dir, is_fn });
                         }
-                        // Avaler l'événement : macOS ne change pas le volume et n'affiche pas la jauge HUD
+                        // Avaler l'événement : macOS ne change pas le volume/luminosité et n'affiche pas la jauge HUD
                         return std::ptr::null_mut();
                     } else if is_down {
                         let mut status = shared.status.lock().unwrap();
@@ -541,6 +619,7 @@ unsafe extern "C" fn tap_callback(
                             dir,
                             from_slider: true,
                             replaced: false,
+                            is_fn,
                         });
                     }
                 }
@@ -661,6 +740,7 @@ impl Shared {
             dir,
             from_slider: press.from_slider,
             replaced: press.from_slider,
+            is_fn: press.is_fn,
         });
         if !press.from_slider {
             return false;
@@ -668,19 +748,25 @@ impl Shared {
         status.replaced += 1;
         drop(status);
         slot.store(true, Ordering::Relaxed);
-        let _ = self.actions.lock().unwrap().send(dir);
+        let _ = self.actions.lock().unwrap().send(SliderEvent { dir, is_fn: press.is_fn });
         true
     }
 }
 
 // ─────────────────────────── actions ───────────────────────────
 
-fn worker(shared: Arc<Shared>, rx: Receiver<Dir>) {
-    let mut gesture = Gesture::default();
-    for dir in rx {
+fn worker(shared: Arc<Shared>, rx: Receiver<SliderEvent>) {
+    let mut gesture_normal = Gesture::default();
+    let mut gesture_fn = Gesture::default();
+    for ev in rx {
         let config = *shared.config.lock().unwrap();
-        if let Some(dir) = gesture.feed(dir, config, Instant::now()) {
-            perform(config.action, dir);
+        let (action, invert, step, gesture) = if ev.is_fn {
+            (config.fn_action, config.fn_invert, config.fn_step, &mut gesture_fn)
+        } else {
+            (config.action, config.invert, config.step, &mut gesture_normal)
+        };
+        if let Some(dir) = gesture.feed(ev.dir, invert, step, Instant::now()) {
+            perform(action, dir);
         }
     }
 }
@@ -693,14 +779,14 @@ struct Gesture {
 }
 
 impl Gesture {
-    fn feed(&mut self, dir: Dir, config: SliderConfig, now: Instant) -> Option<Dir> {
-        let dir = if config.invert { dir.flip() } else { dir };
+    fn feed(&mut self, dir: Dir, invert: bool, step: u8, now: Instant) -> Option<Dir> {
+        let dir = if invert { dir.flip() } else { dir };
         let same = self
             .last
             .is_some_and(|(at, d)| d == dir && now.duration_since(at) < GESTURE_GAP);
         self.count = if same { self.count + 1 } else { 1 };
         self.last = Some((now, dir));
-        if self.count >= config.step.max(1) {
+        if self.count >= step.max(1) {
             self.count = 0;
             Some(dir)
         } else {
@@ -750,7 +836,7 @@ fn perform(action: Action, dir: Dir) {
     let up = dir == Dir::Up;
     let delta = if up { 120 } else { -120 };
     let inputs = match action {
-        Action::Volume => return,
+        Action::Volume | Action::None => return,
         Action::Scroll => vec![wheel(false, delta)],
         Action::HScroll => vec![wheel(true, delta)],
         Action::Zoom => vec![key(VK_CONTROL, false, false), wheel(false, delta), key(VK_CONTROL, true, false)],
@@ -814,6 +900,8 @@ pub mod macos_events {
     pub const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i16 = 8;
     pub const NX_KEYTYPE_SOUND_UP: u32 = 0;
     pub const NX_KEYTYPE_SOUND_DOWN: u32 = 1;
+    pub const NX_KEYTYPE_BRIGHTNESS_UP: u32 = 2;
+    pub const NX_KEYTYPE_BRIGHTNESS_DOWN: u32 = 3;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -887,6 +975,29 @@ pub mod macos_events {
         }
     }
 
+    pub unsafe fn post_aux_key(key_code: u32) {
+        let cls_nsevent = objc_getClass(b"NSEvent\0".as_ptr());
+        let sel_otherevent = sel_registerName(b"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:\0".as_ptr());
+        let sel_cgevent = sel_registerName(b"CGEvent\0".as_ptr());
+
+        let f_send_event: unsafe extern "C" fn(
+            *mut c_void, *mut c_void, usize, f64, f64, usize, f64, isize, *mut c_void, i16, isize, isize,
+        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        let f_send_cg: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+
+        for state in [0xa00isize, 0xb00isize] {
+            let data1 = ((key_code as isize) << 16) | state;
+            let ns_ev = f_send_event(cls_nsevent, sel_otherevent, 14, 0.0, 0.0, state as usize, 0.0, 0, std::ptr::null_mut(), 8, data1, -1);
+            if !ns_ev.is_null() {
+                let cg_ev = f_send_cg(ns_ev, sel_cgevent);
+                if !cg_ev.is_null() {
+                    CGEventPost(K_CG_HID_EVENT_TAP, cg_ev);
+                }
+            }
+        }
+    }
+
     pub unsafe fn post_key(key: CGKeyCode, flags: u64) {
         let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), key, true);
         let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), key, false);
@@ -930,7 +1041,15 @@ fn perform(action: Action, dir: Dir) {
     let delta = if up { 3 } else { -3 };
     unsafe {
         match action {
-            Action::Volume => {}
+            Action::Volume => {
+                let key = if up { NX_KEYTYPE_SOUND_UP } else { NX_KEYTYPE_SOUND_DOWN };
+                post_aux_key(key);
+            }
+            Action::Brightness => {
+                let key = if up { NX_KEYTYPE_BRIGHTNESS_UP } else { NX_KEYTYPE_BRIGHTNESS_DOWN };
+                post_aux_key(key);
+            }
+            Action::None => {}
             Action::Scroll => post_scroll(delta, 0, 0),
             Action::HScroll => post_scroll(0, delta, 0),
             Action::Zoom => post_scroll(delta, 0, K_CG_EVENT_FLAG_MASK_COMMAND),
@@ -958,18 +1077,16 @@ mod tests {
     fn gesture_step_and_invert() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
-        let cfg = SliderConfig { action: Action::Scroll, invert: false, step: 2 };
         let mut g = Gesture::default();
-        assert_eq!(g.feed(Dir::Up, cfg, ms(0)), None);
-        assert_eq!(g.feed(Dir::Up, cfg, ms(30)), Some(Dir::Up));
-        assert_eq!(g.feed(Dir::Up, cfg, ms(60)), None);
+        assert_eq!(g.feed(Dir::Up, false, 2, ms(0)), None);
+        assert_eq!(g.feed(Dir::Up, false, 2, ms(30)), Some(Dir::Up));
+        assert_eq!(g.feed(Dir::Up, false, 2, ms(60)), None);
         // Changement de sens : nouveau geste.
-        assert_eq!(g.feed(Dir::Down, cfg, ms(90)), None);
-        assert_eq!(g.feed(Dir::Down, cfg, ms(120)), Some(Dir::Down));
+        assert_eq!(g.feed(Dir::Down, false, 2, ms(90)), None);
+        assert_eq!(g.feed(Dir::Down, false, 2, ms(120)), Some(Dir::Down));
         // Pause : nouveau geste.
-        assert_eq!(g.feed(Dir::Down, cfg, ms(1000)), None);
+        assert_eq!(g.feed(Dir::Down, false, 2, ms(1000)), None);
 
-        let inv = SliderConfig { invert: true, step: 1, ..cfg };
-        assert_eq!(Gesture::default().feed(Dir::Up, inv, ms(0)), Some(Dir::Down));
+        assert_eq!(Gesture::default().feed(Dir::Up, true, 1, ms(0)), Some(Dir::Down));
     }
 }

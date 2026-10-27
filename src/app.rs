@@ -857,33 +857,60 @@ impl App {
             if let Some(last) = status.last {
                 let ago = last.at.elapsed().as_secs_f32();
                 let dir = if last.dir == Dir::Up { "+" } else { "−" };
-                let what = if last.from_slider { "slider" } else { "touche volume" };
-                let done = if last.replaced { "remplacé" } else { "laissé au volume" };
-                ui.label(RichText::new(format!("dernier : {what} {dir}, {done}, il y a {ago:.0} s")).color(DIM_TEXT));
+                let prefix = if last.is_fn {
+                    "Fn + slider"
+                } else if last.from_slider {
+                    "slider"
+                } else {
+                    "touche volume"
+                };
+                let done = if last.replaced { "bloqué / remplacé" } else { "laissé au système" };
+                ui.label(RichText::new(format!("dernier : {prefix} {dir}, {done}, il y a {ago:.0} s")).color(DIM_TEXT));
             }
-            ui.label(RichText::new(format!("{} crans remplacés", status.replaced)).color(DIM_TEXT));
+            ui.label(RichText::new(format!("{} crans interceptés", status.replaced)).color(DIM_TEXT));
         });
         ui.ctx().request_repaint_after(Duration::from_millis(300));
         ui.add_space(10.0);
 
         let mut cfg = self.settings.slider;
-        ui.label(RichText::new("Action du slider").strong().size(16.0));
+        ui.label(RichText::new("Action du slider (seul)").strong().size(16.0));
         ui.add_space(4.0);
-        egui::Grid::new("slider-actions").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
-            for action in Action::ALL {
+        egui::Grid::new("slider-actions-normal").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+            for action in Action::ALL_NORMAL {
                 ui.radio_value(&mut cfg.action, action, action.title());
                 ui.label(RichText::new(action.detail()).color(DIM_TEXT));
                 ui.end_row();
             }
         });
         ui.add_space(8.0);
-        ui.add_enabled_ui(cfg.action != Action::Volume, |ui| {
+        ui.add_enabled_ui(cfg.action != Action::Volume && cfg.action != Action::None, |ui| {
             ui.checkbox(&mut cfg.invert, "Inverser le sens");
             ui.horizontal(|ui| {
                 ui.label("Sensibilité : une action tous les");
                 ui.add(egui::Slider::new(&mut cfg.step, 1..=4).suffix(" cran(s)"));
             });
         });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(RichText::new("Action du slider avec touche Fn").strong().size(16.0));
+        ui.add_space(4.0);
+        egui::Grid::new("slider-actions-fn").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+            for action in Action::ALL_FN {
+                ui.radio_value(&mut cfg.fn_action, action, action.title());
+                ui.label(RichText::new(action.detail()).color(DIM_TEXT));
+                ui.end_row();
+            }
+        });
+        ui.add_space(8.0);
+        ui.add_enabled_ui(cfg.fn_action != Action::Brightness && cfg.fn_action != Action::None, |ui| {
+            ui.checkbox(&mut cfg.fn_invert, "Inverser le sens (Fn)");
+            ui.horizontal(|ui| {
+                ui.label("Sensibilité : une action tous les");
+                ui.add(egui::Slider::new(&mut cfg.fn_step, 1..=4).suffix(" cran(s)"));
+            });
+        });
+
         if cfg != self.settings.slider {
             self.settings.slider = cfg;
             self.engine.set_config(cfg);

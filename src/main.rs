@@ -31,12 +31,18 @@ fn main() -> eframe::Result {
     let settings = Settings::load();
     let engine = Engine::start(def.vendor_id, def.product_id, def.matrix.rows, def.matrix.cols, settings.slider);
     let icon = icon();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("Lowfreed — {}", def.name))
+        .with_inner_size([1240.0, 860.0])
+        .with_min_inner_size([900.0, 600.0]);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        viewport = viewport.with_icon(Arc::new(icon.clone()));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("Lowfreed — {}", def.name))
-            .with_inner_size([1240.0, 860.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_icon(Arc::new(icon.clone())),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

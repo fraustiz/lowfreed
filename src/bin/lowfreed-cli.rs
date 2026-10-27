@@ -13,8 +13,8 @@ Commandes :
   dump [couche]        keymap (toutes les couches ou une seule)
   macros               contenu des macros
   set <c> <l> <col> <kc>  assigne un keycode (ex. set 1 0 1 KC_F1)
-  slider <action> [s]  remplace le slider pendant s secondes (volume, scroll, hscroll,
-                       zoom, tabs, tracks, arrows) et affiche chaque cran
+  slider <action> [s]  remplace le slider pendant s secondes (volume, none/unbind,
+                       scroll, hscroll, zoom, tabs, tracks, arrows) et affiche chaque cran
   light <0-255> [0|1]  règle la luminosité et le mode (0=fixe, 1=respiration)
   backup <fichier>     sauvegarde keymap + macros (format VIA .layout.json)
   restore <fichier>    réécrit keymap + macros depuis une sauvegarde";
@@ -123,15 +123,16 @@ fn run(mut args: Vec<String>) -> Result<()> {
 
 fn slider_test(def: &Definition, action: Option<&str>, secs: Option<&String>) -> Result<()> {
     use lowfreed::slider::{Action, Dir, Engine, SliderConfig};
-    let action = match action.context("slider attend une action")? {
+    let action = match action.context("slider attend une action")?.to_lowercase().as_str() {
         "volume" => Action::Volume,
+        "none" | "unbind" | "off" | "disabled" => Action::None,
         "scroll" => Action::Scroll,
         "hscroll" => Action::HScroll,
         "zoom" => Action::Zoom,
         "tabs" => Action::Tabs,
         "tracks" => Action::Tracks,
         "arrows" => Action::Arrows,
-        other => bail!("action inconnue « {other} »"),
+        other => bail!("action inconnue « {other} » (attend : volume, none/unbind, scroll, hscroll, zoom, tabs, tracks, arrows)"),
     };
     let secs: u64 = secs.map(|s| s.parse()).transpose()?.unwrap_or(60);
     if lowfreed::system::single_instance().is_none() {
