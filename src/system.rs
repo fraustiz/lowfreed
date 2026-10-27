@@ -302,6 +302,210 @@ pub fn single_instance() -> Option<ShowSignal> {
     Some(ShowSignal { rx })
 }
 
+#[cfg(target_os = "macos")]
+pub mod macos_app {
+    use std::ffi::c_void;
+
+    extern "C" {
+        fn objc_getClass(name: *const u8) -> *mut c_void;
+        fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        fn class_getName(cls: *mut c_void) -> *const std::ffi::c_char;
+        fn sel_registerName(name: *const u8) -> *mut c_void;
+        fn class_addMethod(cls: *mut c_void, name: *mut c_void, imp: *const (), types: *const u8) -> bool;
+        fn class_replaceMethod(cls: *mut c_void, name: *mut c_void, imp: *const (), types: *const u8) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_quitting(val: bool) {
+        QUITTING.store(val, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_quitting() -> bool {
+        QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    unsafe extern "C" fn should_app_terminate(_this: *mut c_void, _sel: *mut c_void, _app: *mut c_void) -> usize {
+        if is_quitting() {
+            eprintln!("[Lowfreed] applicationShouldTerminate: quitting -> NSTerminateNow");
+            1 // NSTerminateNow
+        } else {
+            eprintln!("[Lowfreed] applicationShouldTerminate: background active -> NSTerminateCancel");
+            0 // NSTerminateCancel
+        }
+    }
+
+    static OPEN_TRIGGER: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn set_open_trigger(f: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut guard) = OPEN_TRIGGER.lock() {
+            *guard = Some(f);
+        }
+    }
+
+    pub fn trigger_open() {
+        if let Ok(guard) = OPEN_TRIGGER.lock() {
+            if let Some(f) = guard.as_ref() {
+                f();
+            }
+        }
+    }
+
+    unsafe extern "C" fn did_become_active(
+        _this: *mut c_void,
+        _sel: *mut c_void,
+        _notif: *mut c_void,
+    ) {
+        show_main_window();
+        trigger_open();
+    }
+
+    unsafe extern "C" fn should_handle_reopen(
+        _this: *mut c_void,
+        _sel: *mut c_void,
+        _app: *mut c_void,
+        _has_visible: bool,
+    ) -> bool {
+        show_main_window();
+        trigger_open();
+        true
+    }
+
+    unsafe extern "C" fn should_terminate(_this: *mut c_void, _sel: *mut c_void, _app: *mut c_void) -> bool {
+        false
+    }
+
+    /// Empêche macOS de tuer l'application en arrière-plan (Automatic Termination, Sudden Termination,
+    /// et fermeture de la dernière fenêtre) lorsque celle-ci est réduite dans la zone de notification.
+    pub fn prevent_background_termination() {
+        unsafe {
+            // 1. Désactiver Sudden Termination et Automatic Termination sur NSProcessInfo
+            let cls_proc = objc_getClass(b"NSProcessInfo\0".as_ptr());
+            let sel_proc = sel_registerName(b"processInfo\0".as_ptr());
+            let sel_dis_sudden = sel_registerName(b"disableSuddenTermination\0".as_ptr());
+            let sel_dis_auto = sel_registerName(b"disableAutomaticTermination:\0".as_ptr());
+            let cls_str = objc_getClass(b"NSString\0".as_ptr());
+            let sel_utf8 = sel_registerName(b"stringWithUTF8String:\0".as_ptr());
+
+            let f_send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let proc = f_send(cls_proc, sel_proc);
+            if !proc.is_null() {
+                f_send(proc, sel_dis_sudden);
+
+                let f_str: unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let reason = f_str(cls_str, sel_utf8, b"Lowfreed menu bar background service\0".as_ptr());
+                let f_dis: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                f_dis(proc, sel_dis_auto, reason);
+            }
+
+            // 2. Intercepter applicationShouldTerminateAfterLastWindowClosed: sur le delegate NSApp
+            let cls_nsapp = objc_getClass(b"NSApplication\0".as_ptr());
+            let sel_shared = sel_registerName(b"sharedApplication\0".as_ptr());
+            let sel_del = sel_registerName(b"delegate\0".as_ptr());
+            let app = f_send(cls_nsapp, sel_shared);
+            if !app.is_null() {
+                let del = f_send(app, sel_del);
+                if !del.is_null() {
+                    let del_cls = object_getClass(del);
+                    let sel_term = sel_registerName(b"applicationShouldTerminateAfterLastWindowClosed:\0".as_ptr());
+                    let types = b"B@:@\0".as_ptr(); // returns BOOL (B), self (@), _cmd (:), sender (@)
+                    let added = class_addMethod(del_cls, sel_term, should_terminate as *const (), types);
+                    if !added {
+                        class_replaceMethod(del_cls, sel_term, should_terminate as *const (), types);
+                    }
+                    let sel_app_term = sel_registerName(b"applicationShouldTerminate:\0".as_ptr());
+                    let types_app_term = b"Q@:@\0".as_ptr();
+                    let added_app_term = class_addMethod(del_cls, sel_app_term, should_app_terminate as *const (), types_app_term);
+                    if !added_app_term {
+                        class_replaceMethod(del_cls, sel_app_term, should_app_terminate as *const (), types_app_term);
+                    }
+                    let sel_reopen = sel_registerName(b"applicationShouldHandleReopen:hasVisibleWindows:\0".as_ptr());
+                    let types_reopen = b"B@:@B\0".as_ptr();
+                    let added_reopen = class_addMethod(del_cls, sel_reopen, should_handle_reopen as *const (), types_reopen);
+                    if !added_reopen {
+                        class_replaceMethod(del_cls, sel_reopen, should_handle_reopen as *const (), types_reopen);
+                    }
+                    let sel_active = sel_registerName(b"applicationDidBecomeActive:\0".as_ptr());
+                    let types_active = b"v@:@\0".as_ptr();
+                    let added_active = class_addMethod(del_cls, sel_active, did_become_active as *const (), types_active);
+                    if !added_active {
+                        class_replaceMethod(del_cls, sel_active, did_become_active as *const (), types_active);
+                    }
+                    let name = std::ffi::CStr::from_ptr(class_getName(del_cls)).to_string_lossy();
+                    eprintln!("[Lowfreed] prevent_background_termination: hooked {name}, added={added}, added_app_term={added_app_term}, added_reopen={added_reopen}, added_active={added_active}");
+                }
+            }
+        }
+    }
+
+    /// Active l'application et la place au premier plan lors du clic sur l'icône de la barre des menus.
+    pub fn activate_app() {
+        show_main_window();
+    }
+
+    /// Affiche et active la fenêtre principale (utilisé lors du clic sur le tray ou réouverture Dock).
+    pub fn show_main_window() {
+        unsafe {
+            let cls_nsapp = objc_getClass(b"NSApplication\0".as_ptr());
+            let sel_shared = sel_registerName(b"sharedApplication\0".as_ptr());
+            let f_send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let app = f_send(cls_nsapp, sel_shared);
+            if app.is_null() {
+                return;
+            }
+
+            let sel_windows = sel_registerName(b"windows\0".as_ptr());
+            let windows = f_send(app, sel_windows);
+            if !windows.is_null() {
+                let sel_count = sel_registerName(b"count\0".as_ptr());
+                let f_count: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let count = f_count(windows, sel_count);
+
+                let sel_obj_at = sel_registerName(b"objectAtIndex:\0".as_ptr());
+                let f_obj_at: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void =
+                    std::mem::transmute(objc_msgSend as *const ());
+
+                let sel_set_vis = sel_registerName(b"setIsVisible:\0".as_ptr());
+                let f_set_vis: unsafe extern "C" fn(*mut c_void, *mut c_void, bool) =
+                    std::mem::transmute(objc_msgSend as *const ());
+
+                let sel_make_key = sel_registerName(b"makeKeyAndOrderFront:\0".as_ptr());
+                let f_make_key: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                    std::mem::transmute(objc_msgSend as *const ());
+
+                let sel_order_front = sel_registerName(b"orderFrontRegardless\0".as_ptr());
+                let sel_demin = sel_registerName(b"deminiaturize:\0".as_ptr());
+
+                for i in 0..count {
+                    let win = f_obj_at(windows, sel_obj_at, i);
+                    if !win.is_null() {
+                        let win_cls = object_getClass(win);
+                        let name = std::ffi::CStr::from_ptr(class_getName(win_cls)).to_bytes();
+                        if !name.starts_with(b"NSStatusBarWindow") {
+                            f_send(win, sel_demin);
+                            f_set_vis(win, sel_set_vis, true);
+                            f_make_key(win, sel_make_key, std::ptr::null_mut());
+                            f_send(win, sel_order_front);
+                        }
+                    }
+                }
+            }
+
+            let sel_activate = sel_registerName(b"activateIgnoringOtherApps:\0".as_ptr());
+            let f_act: unsafe extern "C" fn(*mut c_void, *mut c_void, bool) =
+                std::mem::transmute(objc_msgSend as *const ());
+            f_act(app, sel_activate, true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

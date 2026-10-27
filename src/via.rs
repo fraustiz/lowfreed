@@ -4,10 +4,35 @@
 //! et sur son interface n°2 via le dongle 2.4G. Les commandes et leurs
 //! réponses ont été vérifiées sur le clavier (protocole v12, 6 couches, 16 macros).
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use hidapi::{HidApi, HidDevice};
+
+static SHARED_HID_API: Mutex<Option<HidApi>> = Mutex::new(None);
+
+/// Exécute une opération avec l'instance partagée de `HidApi`.
+///
+/// Sur macOS (et particulièrement Apple Silicon), créer et détruire `HidApi`
+/// à plusieurs reprises sur des fils d'exécution courts corrompt l'état de
+/// IOHIDManager (`__CFCheckCFInfoPACSignature`). Réutiliser une instance unique
+/// évite tout crash.
+pub fn with_hidapi<R>(f: impl FnOnce(&mut HidApi) -> Result<R>) -> Result<R> {
+    let mut guard = SHARED_HID_API.lock().map_err(|e| anyhow!("mutex hid: {e}"))?;
+    if guard.is_none() {
+        *guard = Some(HidApi::new().context("initialisation HID impossible")?);
+    }
+    let api = guard.as_mut().unwrap();
+    let _ = api.refresh_devices();
+    f(api)
+}
+
+/// Initialise `HidApi` sur le fil principal (requis sous macOS pour que IOHIDManager
+/// s'attache au RunLoop principal permanent et non à un fil d'arrière-plan éphémère).
+pub fn init_main_thread() {
+    let _ = with_hidapi(|_| Ok(()));
+}
 
 pub const REPORT_LEN: usize = 32;
 /// Charge utile maximale d'une requête de lecture/écriture de tampon.
@@ -77,26 +102,27 @@ pub struct Via {
 impl Via {
     /// Ouvre l'interface VIA du clavier `vid:pid`.
     pub fn open(vendor_id: u16, product_id: u16) -> Result<Self> {
-        let api = HidApi::new().context("initialisation HID impossible")?;
-        let found = api
-            .device_list()
-            .find(|d| {
-                d.vendor_id() == vendor_id
-                    && d.product_id() == product_id
-                    && d.usage_page() == USAGE_PAGE
-                    && d.usage() == USAGE
-            })
-            .ok_or_else(|| anyhow!("clavier {vendor_id:04X}:{product_id:04X} introuvable"))?;
-        let info = DeviceInfo {
-            vendor_id,
-            product_id,
-            product: found.product_string().unwrap_or("?").to_string(),
-            release: found.release_number(),
-        };
-        let dev = found
-            .open_device(&api)
-            .context("ouverture de l'interface VIA impossible")?;
-        Ok(Self { dev, info })
+        with_hidapi(|api| {
+            let found = api
+                .device_list()
+                .find(|d| {
+                    d.vendor_id() == vendor_id
+                        && d.product_id() == product_id
+                        && d.usage_page() == USAGE_PAGE
+                        && d.usage() == USAGE
+                })
+                .ok_or_else(|| anyhow!("clavier {vendor_id:04X}:{product_id:04X} introuvable"))?;
+            let info = DeviceInfo {
+                vendor_id,
+                product_id,
+                product: found.product_string().unwrap_or("?").to_string(),
+                release: found.release_number(),
+            };
+            let dev = found
+                .open_device(api)
+                .context("ouverture de l'interface VIA impossible")?;
+            Ok(Self { dev, info })
+        })
     }
 
     /// Envoie une requête et attend la réponse dont les `echo` premiers octets

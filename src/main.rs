@@ -3,7 +3,9 @@
 mod app;
 mod tray;
 
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
+#[cfg(not(target_os = "macos"))]
+use std::sync::Arc;
 
 use eframe::egui;
 use lowfreed::{
@@ -13,6 +15,9 @@ use lowfreed::{
 };
 
 fn main() -> eframe::Result {
+    // Initialise HID sur le fil principal pour macOS (évite d'associer le RunLoop à un fil éphémère).
+    lowfreed::via::init_main_thread();
+
     // `lowfreed [--tray] [définition.json]` : `--tray` démarre fenêtre masquée (lancement
     // au démarrage de Windows) ; un JSON charge une autre définition VIA que celle du Flow 2.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,6 +36,7 @@ fn main() -> eframe::Result {
     let settings = Settings::load();
     let engine = Engine::start(def.vendor_id, def.product_id, def.matrix.rows, def.matrix.cols, settings.slider);
     let icon = icon();
+    #[allow(unused_mut)]
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("Lowfreed — {}", def.name))
         .with_inner_size([1240.0, 860.0])
@@ -49,6 +55,9 @@ fn main() -> eframe::Result {
         "Lowfreed",
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            system::macos_app::prevent_background_termination();
+
             let (tx, rx) = mpsc::channel();
             tray::spawn(show_signal, icon, tx, cc.egui_ctx.clone());
             Ok(Box::new(app::App::new(cc, def, engine, settings, rx, start_hidden)))

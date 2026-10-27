@@ -229,15 +229,14 @@ impl App {
                             Ok(v) if v.info.is_wireless() => ConnectResult::WirelessSleeping,
                             Ok(_) => ConnectResult::NotReady(format!("{e:#}")),
                             Err(_) => {
-                                let has_bt = hidapi::HidApi::new()
-                                    .map(|api| {
-                                        api.device_list().any(|d| {
-                                            d.product_string()
-                                                .map(|p| p.contains("Flow2") || p.contains("Lofree"))
-                                                .unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(false);
+                                let has_bt = lowfreed::via::with_hidapi(|api| {
+                                    Ok(api.device_list().any(|d| {
+                                        d.product_string()
+                                            .map(|p| p.contains("Flow2") || p.contains("Lofree"))
+                                            .unwrap_or(false)
+                                    }))
+                                })
+                                .unwrap_or(false);
                                 if has_bt {
                                     ConnectResult::BluetoothDetected
                                 } else {
@@ -1206,6 +1205,22 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.settings.close_to_tray && !self.quitting {
+            let mut close_caught = false;
+            for viewport in raw_input.viewports.values_mut() {
+                if viewport.events.contains(&egui::ViewportEvent::Close) {
+                    close_caught = true;
+                    viewport.events.retain(|e| !matches!(e, egui::ViewportEvent::Close));
+                }
+            }
+            if close_caught {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+    }
+
     /// Appelée aussi quand la fenêtre est masquée : commandes de la zone de notification
     /// et fermeture → réduction.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1228,23 +1243,37 @@ impl eframe::App for App {
         while let Ok(cmd) = self.tray_rx.try_recv() {
             match cmd {
                 TrayCommand::Open => {
+                    #[cfg(target_os = "macos")]
+                    lowfreed::system::macos_app::activate_app();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayCommand::Quit => {
                     self.quitting = true;
+                    #[cfg(target_os = "macos")]
+                    lowfreed::system::macos_app::set_quitting(true);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    #[cfg(target_os = "macos")]
+                    std::process::exit(0);
                 }
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.settings.close_to_tray && !self.quitting {
+        if self.settings.close_to_tray && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.settings.close_to_tray && !self.quitting {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
         while let Ok(res) = self.connect_rx.try_recv() {
             self.connecting = false;
             match res {
@@ -1315,11 +1344,27 @@ impl eframe::App for App {
             ui.add_space(3.0);
         });
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Keymap => self.keymap_tab(ui),
+            Tab::Keymap => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.keymap_tab(ui));
+            }
             Tab::Macros => self.macros_tab(ui),
-            Tab::Lighting => self.lighting_tab(ui),
-            Tab::Slider => self.slider_tab(ui),
-            Tab::Tester => self.tester_tab(ui),
+            Tab::Lighting => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.lighting_tab(ui));
+            }
+            Tab::Slider => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.slider_tab(ui));
+            }
+            Tab::Tester => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.tester_tab(ui));
+            }
         });
         let ctx = ui.ctx().clone();
         self.pending_modal(&ctx);

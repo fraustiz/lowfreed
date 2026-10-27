@@ -113,6 +113,14 @@ pub fn spawn(signal: ShowSignal, icon: egui::IconData, tx: Sender<TrayCommand>, 
         ctx.request_repaint();
     });
 
+    #[cfg(target_os = "macos")]
+    {
+        let s = send.clone();
+        lowfreed::system::macos_app::set_open_trigger(Arc::new(move || {
+            s(TrayCommand::Open);
+        }));
+    }
+
     let open = MenuItem::new("Ouvrir Lowfreed", true, None);
     let quit = MenuItem::new("Quitter", true, None);
     let Ok(menu) = Menu::with_items(&[&open, &PredefinedMenuItem::separator(), &quit]) else { return };

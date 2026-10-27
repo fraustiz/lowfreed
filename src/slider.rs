@@ -400,7 +400,10 @@ fn volume_keys(via: &Via, rows: u8, cols: u8) -> Vec<usize> {
 
 fn reader(shared: Arc<Shared>, vendor_id: u16, product_id: u16, rows: u8, cols: u8) {
     loop {
-        let found = HidApi::new().ok().and_then(|api| open(&api, vendor_id, product_id));
+        let found = crate::via::with_hidapi(|api| {
+            open(api, vendor_id, product_id).ok_or_else(|| anyhow::anyhow!("introuvable"))
+        })
+        .ok();
         let Some((consumer, via)) = found else {
             shared.status.lock().unwrap().device = false;
             thread::sleep(RECONNECT_EVERY);
@@ -765,30 +768,45 @@ fn worker(shared: Arc<Shared>, rx: Receiver<SliderEvent>) {
         } else {
             (config.action, config.invert, config.step, &mut gesture_normal)
         };
-        if let Some(dir) = gesture.feed(ev.dir, invert, step, Instant::now()) {
-            perform(action, dir);
+        if let Some((dir, speed)) = gesture.feed(ev.dir, invert, step, Instant::now()) {
+            perform(action, dir, speed);
         }
     }
 }
 
-/// Applique le sens et la sensibilité : une action tous les `step` crans d'un même geste.
+/// Applique le sens, la sensibilité et l'accélération dynamique :
+/// - une action tous les `step` crans
+/// - accélération progressive (1x à 4x) si les crans s'enchaînent rapidement
 #[derive(Default)]
 struct Gesture {
     count: u8,
     last: Option<(Instant, Dir)>,
+    streak: u8,
 }
 
 impl Gesture {
-    fn feed(&mut self, dir: Dir, invert: bool, step: u8, now: Instant) -> Option<Dir> {
+    fn feed(&mut self, dir: Dir, invert: bool, step: u8, now: Instant) -> Option<(Dir, u32)> {
         let dir = if invert { dir.flip() } else { dir };
         let same = self
             .last
             .is_some_and(|(at, d)| d == dir && now.duration_since(at) < GESTURE_GAP);
-        self.count = if same { self.count + 1 } else { 1 };
+        if same {
+            let dt = self.last.map(|(at, _)| now.duration_since(at)).unwrap_or_default();
+            if dt < Duration::from_millis(120) {
+                self.streak = (self.streak + 1).min(6);
+            } else {
+                self.streak = self.streak.saturating_sub(1);
+            }
+            self.count += 1;
+        } else {
+            self.count = 1;
+            self.streak = 0;
+        }
         self.last = Some((now, dir));
         if self.count >= step.max(1) {
             self.count = 0;
-            Some(dir)
+            let speed = 1 + (self.streak as u32 / 2);
+            Some((dir, speed))
         } else {
             None
         }
@@ -832,14 +850,14 @@ fn tap(vk: VIRTUAL_KEY, extended: bool) -> Vec<INPUT> {
 }
 
 #[cfg(windows)]
-fn perform(action: Action, dir: Dir) {
+fn perform(action: Action, dir: Dir, speed: u32) {
     let up = dir == Dir::Up;
-    let delta = if up { 120 } else { -120 };
+    let delta = if up { 120 * speed.min(4) as i32 } else { -120 * speed.min(4) as i32 };
     let inputs = match action {
         Action::Volume | Action::None => return,
         Action::Scroll => vec![wheel(false, delta)],
         Action::HScroll => vec![wheel(true, delta)],
-        Action::Zoom => vec![key(VK_CONTROL, false, false), wheel(false, delta), key(VK_CONTROL, true, false)],
+        Action::Zoom => vec![key(VK_CONTROL, false, false), wheel(false, if up { 120 } else { -120 }), key(VK_CONTROL, true, false)],
         Action::Tabs => {
             let mut v = vec![key(VK_CONTROL, false, false)];
             if !up {
@@ -1035,10 +1053,12 @@ pub fn open_accessibility_settings() {
 }
 
 #[cfg(target_os = "macos")]
-fn perform(action: Action, dir: Dir) {
+fn perform(action: Action, dir: Dir, speed: u32) {
     use macos_events::*;
     let up = dir == Dir::Up;
-    let delta = if up { 3 } else { -3 };
+    // Défilement dynamique : 6 lignes de base, accéléré jusqu'à 24 lignes sur balayage rapide
+    let scroll_lines = (6 * speed) as i32;
+    let delta = if up { scroll_lines } else { -scroll_lines };
     unsafe {
         match action {
             Action::Volume => {
@@ -1052,7 +1072,7 @@ fn perform(action: Action, dir: Dir) {
             Action::None => {}
             Action::Scroll => post_scroll(delta, 0, 0),
             Action::HScroll => post_scroll(0, delta, 0),
-            Action::Zoom => post_scroll(delta, 0, K_CG_EVENT_FLAG_MASK_COMMAND),
+            Action::Zoom => post_scroll(if up { 1 } else { -1 }, 0, K_CG_EVENT_FLAG_MASK_COMMAND),
             Action::Tabs => {
                 let key = if up { KEY_BRACKET_RIGHT } else { KEY_BRACKET_LEFT };
                 post_key(key, K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT);
@@ -1067,7 +1087,7 @@ fn perform(action: Action, dir: Dir) {
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
-fn perform(_action: Action, _dir: Dir) {}
+fn perform(_action: Action, _dir: Dir, _speed: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -1079,14 +1099,14 @@ mod tests {
         let ms = |n| t0 + Duration::from_millis(n);
         let mut g = Gesture::default();
         assert_eq!(g.feed(Dir::Up, false, 2, ms(0)), None);
-        assert_eq!(g.feed(Dir::Up, false, 2, ms(30)), Some(Dir::Up));
+        assert_eq!(g.feed(Dir::Up, false, 2, ms(30)), Some((Dir::Up, 1)));
         assert_eq!(g.feed(Dir::Up, false, 2, ms(60)), None);
         // Changement de sens : nouveau geste.
         assert_eq!(g.feed(Dir::Down, false, 2, ms(90)), None);
-        assert_eq!(g.feed(Dir::Down, false, 2, ms(120)), Some(Dir::Down));
+        assert_eq!(g.feed(Dir::Down, false, 2, ms(120)), Some((Dir::Down, 1)));
         // Pause : nouveau geste.
         assert_eq!(g.feed(Dir::Down, false, 2, ms(1000)), None);
 
-        assert_eq!(Gesture::default().feed(Dir::Up, true, 1, ms(0)), Some(Dir::Down));
+        assert_eq!(Gesture::default().feed(Dir::Up, true, 1, ms(0)), Some((Dir::Down, 1)));
     }
 }
